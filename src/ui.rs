@@ -1,19 +1,30 @@
 #![allow(unused)]
 
+use crate::color::Color;
+use crate::gpu::{FONT_SIZE, Gpu};
+
+#[cfg(debug_assertions)]
+use std::cell::RefCell;
+
+use std::boxed::Box as Boxed;
 use std::collections::HashMap;
 
-use cranelift_entity::PrimaryMap;
 use smallvec::SmallVec;
+use cranelift_entity::PrimaryMap;
 
-use crate::{color::Color, gpu::{FONT_SIZE, Gpu}};
+const OVERSCROLL_HEIGHT: f32 = 80.0;
+const DEFAULT_PADDING: f32 = 4.0;
 
-#[derive(Eq, PartialEq, PartialOrd, Copy, Clone, Debug)]
+#[derive(Eq, PartialEq, PartialOrd, Copy, Clone, Debug, Hash)]
+pub struct LabelHash(pub u64);
+
+#[derive(Eq, PartialEq, PartialOrd, Copy, Clone, Debug, Hash)]
 pub struct BoxRef(pub u32);
 
 cranelift_entity::entity_impl!(BoxRef);
 
 bitflags::bitflags! {
-    #[derive(Clone, Copy, Default)]
+    #[derive(Debug, Clone, Copy, Default)]
     pub struct BoxFlags: u32 {
         const DRAW_BG         = 0x0;
         const DRAW_BORDER     = 0x1;
@@ -51,26 +62,35 @@ impl BoxCustom {
 }
 
 pub struct Box {
-    pub key: u64,   // string hash - links to BoxPersist
+    pub key: LabelHash,   // Links to BoxPersist
 
     pub children: SmallVec<[BoxRef; 4]>,
     pub parent: Option<BoxRef>,
 
-    // appearance
+    // Appearance
     pub flags:        BoxFlags,
     pub bg_color:     Color,
     pub hover_color:  Color,
     pub border_color: Color,
-    pub text:         String, // @Memory
     pub text_color:   Color,
+    pub text:         Boxed<str>,  // @Memory
 
-    // layout INPUT
-    pub pref_size:  [Size; 2],
-    pub child_axis: Axis,
-    pub padding:    f32,
+    //
+    // NOTE: This expects an already scaled font size,
+    // meaning that this is the FINAL pixel size, and
+    // there will not be any mutation of it downstream.
+    //
+    pub font_size:    f32,
 
-    // layout OUTPUT
-    pub rect: [f32; 4], // x0, y0, x1, y1
+    // Layout INPUT
+    pub pref_size:     [Size; 2],
+    pub child_axis:    Axis,
+    pub padding:       f32,  // @Cleanup
+    pub padding_left:  f32,
+    pub padding_right: f32,
+
+    // Layout OUTPUT
+    pub rect:          [f32; 4], // x0, y0, x1, y1
     pub computed_size: [f32; 2], // w, h
 
     pub custom: BoxCustom,
@@ -79,20 +99,23 @@ pub struct Box {
 impl Default for Box {
     fn default() -> Self {
         Self {
-            key:           0,
+            key:           LabelHash(0),
             parent:        None,
             children:      SmallVec::default(),
             pref_size:     [Size::fill(), Size::fill()],
             child_axis:    Axis::X,
-            padding:       4.0,
+            padding:       DEFAULT_PADDING,
+            padding_left:  DEFAULT_PADDING,
+            padding_right: DEFAULT_PADDING,
             flags:         BoxFlags::empty(),
             bg_color:      Color::default(),
             hover_color:   Color::default(),
             border_color:  Color::default(),
-            text:          String::new(),
+            text:          Boxed::default(),
             text_color:    Color::rgba(255, 255, 255, 255),
             computed_size: [0.0; 2],
             rect:          [0.0; 4],
+            font_size:     FONT_SIZE,
             custom:        Default::default(),
         }
     }
@@ -109,9 +132,16 @@ impl Box {
 pub struct BoxPersist {
     pub hot_t:              f32,   // hover  [0..1]
     pub active_t:           f32,   // click  [0..1]
-    pub scroll_off:         f32,   // scroll offset in pixels
+
     pub last_frame_touched: u64,
+
     pub cursor_visual_x:    f32,
+
+    pub scroll_offset:      f32,
+    pub scroll_target:      f32,
+    pub scroll_overscroll:  f32,
+    pub scroll_visual:      f32,
+    pub scroll_velocity:    f32,
 }
 
 #[derive(Clone, Copy)]
@@ -142,21 +172,27 @@ pub enum Axis { #[default] X, Y }
 // These let callers push/pop style without passing params everywhere
 #[derive(Default)]
 struct Stacks {
-    size_x:     Vec<Size>,
-    size_y:     Vec<Size>,
-    bg_color:   Vec<Color>,
-    text_color: Vec<Color>,
-    child_axis: Vec<Axis>,
-    padding:    Vec<f32>,
+    size_x:        Vec<Size>,
+    size_y:        Vec<Size>,
+    bg_color:      Vec<Color>,
+    text_color:    Vec<Color>,
+    child_axis:    Vec<Axis>,
+    padding:       Vec<f32>,
+    padding_left:  Vec<f32>,
+    padding_right: Vec<f32>,
+    font_size:     Vec<f32>,
 }
 
 impl Stacks {
-    fn top_size_x(&self)     -> Size   { self.size_x.last().copied().unwrap_or(Size::fill()) }
-    fn top_size_y(&self)     -> Size   { self.size_y.last().copied().unwrap_or(Size::fill()) }
-    fn top_bg(&self)         -> Color  { self.bg_color.last().copied().unwrap_or(Color::default()) }
-    fn top_text_color(&self) -> Color  { self.text_color.last().copied().unwrap_or(Color::rgba(255,255,255,255)) }
-    fn top_axis(&self)       -> Axis   { self.child_axis.last().copied().unwrap_or(Axis::X) }
-    fn top_padding(&self)    -> f32    { self.padding.last().copied().unwrap_or(4.0) }
+    fn top_size_x(&self)        -> Size  { self.size_x.last().copied().unwrap_or(Size::fill()) }
+    fn top_size_y(&self)        -> Size  { self.size_y.last().copied().unwrap_or(Size::fill()) }
+    fn top_bg(&self)            -> Color { self.bg_color.last().copied().unwrap_or(Color::default()) }
+    fn top_text_color(&self)    -> Color { self.text_color.last().copied().unwrap_or(Color::rgba(255,255,255,255)) }
+    fn top_font_size(&self)     -> f32   { self.font_size.last().copied().unwrap_or(FONT_SIZE) }
+    fn top_axis(&self)          -> Axis  { self.child_axis.last().copied().unwrap_or(Axis::X) }
+    fn top_padding(&self)       -> f32   { self.padding.last().copied().unwrap_or(DEFAULT_PADDING) }
+    fn top_padding_left(&self)  -> f32   { self.padding_left.last().copied().unwrap_or(self.top_padding()) }
+    fn top_padding_right(&self) -> f32   { self.padding_right.last().copied().unwrap_or(self.top_padding()) }
 }
 
 pub struct UiState {
@@ -171,42 +207,77 @@ pub struct UiState {
     stacks:         Stacks,
 
     // persistent state - survives across frames
-    pub persist:    HashMap<u64, BoxPersist>,
+    pub persist:    HashMap<LabelHash, BoxPersist>,
 
     // interaction
-    pub hot_key:    u64,    // currently hovered
-    pub active_key: u64,    // currently pressed
+    pub hot_key:    LabelHash,  // Currently hovered box, 0 => no box
+    pub active_key: LabelHash,  // Currently pressed box, 0 => no box
 
-    // frame counter - used to reap dead persist entries
-    pub frame:      u64,
+    // Used to reap dead persist entries
+    pub frame_counter: u64,
 
-    // window size - needed for root box and ParentPct
+    // Needed for root box and ParentPct
     pub win_w:      f32,
     pub win_h:      f32,
+
+    #[cfg(debug_assertions)]
+    __debug_label_strings: RefCell<HashMap<LabelHash, Boxed<str>>>
 }
 
 impl UiState {
     #[inline]
     pub fn new(win_w: f32, win_h: f32) -> Self {
         Self {
-            boxes:        PrimaryMap::default(),
-            root:         None,
-            parent_stack: Vec::new(),
-            stacks:       Stacks::default(),
-            persist:      HashMap::new(),
-            hot_key:      0,
-            active_key:   0,
-            frame:        0,
             win_w,
             win_h,
+
+            boxes:         PrimaryMap::default(),
+            root:          None,
+            parent_stack:  Vec::new(),
+            stacks:        Stacks::default(),
+            persist:       HashMap::new(),
+            hot_key:       LabelHash(0),
+            active_key:    LabelHash(0),
+            frame_counter: 0,
+
+            #[cfg(debug_assertions)]
+            __debug_label_strings: Default::default()
         }
+    }
+
+    #[inline]
+    pub fn hash_str(&self, s: impl AsRef<str>) -> LabelHash {
+        #[inline]
+        fn hash_str_impl(s: &str) -> LabelHash {
+            let mut h: u64 = 5381;
+            for b in s.bytes() {
+                h = h.wrapping_mul(33).wrapping_add(b as u64);
+            }
+
+            LabelHash(h)
+        }
+
+        let s = s.as_ref();
+        let hash = hash_str_impl(s);
+
+        #[cfg(debug_assertions)] {
+            self.__debug_label_strings.borrow_mut().insert(hash, s.into());
+        }
+
+        hash
+    }
+
+    #[inline]
+    #[cfg(debug_assertions)]
+    pub fn __debug_hash_to_str(&self, hash: LabelHash) -> Option<Boxed<str>> {
+        self.__debug_label_strings.borrow().get(&hash).cloned()
     }
 
     #[inline]
     pub fn begin_frame(&mut self, win_w: f32, win_h: f32) {
         self.win_w = win_w;
         self.win_h = win_h;
-        self.frame += 1;
+        self.frame_counter += 1;
         self.boxes.clear();
         self.parent_stack.clear();
 
@@ -224,29 +295,32 @@ impl UiState {
     #[inline]
     pub fn end_frame(&mut self) {
         // Remove persist entries not touched this frame
-        self.persist.retain(|_, p| p.last_frame_touched == self.frame);
+        self.persist.retain(|_, p| p.last_frame_touched == self.frame_counter);
     }
 
     #[inline]
-    pub fn was_clicked(&self, key: BoxRef) -> bool {
-        let string_key = self.boxes[key].key;
+    pub fn was_clicked(&self, id: BoxRef) -> bool {
+        let string_key = self.boxes[id].key;
         string_key == self.active_key
     }
 
     /// Push a new box as child of current parent, return its key
     #[inline]
-    pub fn push_box(&mut self, string_key: u64, flags: BoxFlags) -> BoxRef {
-        let persist = self.persist.entry(string_key).or_default();
-        persist.last_frame_touched = self.frame;
+    pub fn push_box(&mut self, label_hash: LabelHash, flags: BoxFlags) -> BoxRef {
+        let persist = self.persist.entry(label_hash).or_default();
+        persist.last_frame_touched = self.frame_counter;
 
         let parent = self.parent_stack.last().copied();
 
         let id = self.boxes.push(Box {
-            key:        string_key,
+            key:        label_hash,
             parent,
+            font_size:  self.stacks.top_font_size(),
             pref_size:  [self.stacks.top_size_x(), self.stacks.top_size_y()],
             child_axis: self.stacks.top_axis(),
             padding:    self.stacks.top_padding(),
+            padding_left:  self.stacks.top_padding_left(),
+            padding_right: self.stacks.top_padding_right(),
             flags,
             bg_color:   self.stacks.top_bg(),
             text_color: self.stacks.top_text_color(),
@@ -262,8 +336,8 @@ impl UiState {
     }
 
     #[inline]
-    pub fn push_parent(&mut self, key: BoxRef) {
-        self.parent_stack.push(key);
+    pub fn push_parent(&mut self, id: BoxRef) {
+        self.parent_stack.push(id);
     }
 
     #[inline]
@@ -272,8 +346,46 @@ impl UiState {
     }
 
     #[inline]
+    pub fn get_scroll(&self, key: &str) -> f32 {
+        let k = self.hash_str(key);
+        self.persist.get(&k).map(|p| p.scroll_offset).unwrap_or(0.0)
+    }
+
+    #[inline]
+    pub fn clamp_scroll(&mut self, key: &str, content_h: f32, viewport_h: f32) {
+        let k = self.hash_str(key);
+        if let Some(p) = self.persist.get_mut(&k) {
+            let max_scroll = (content_h - viewport_h).max(0.0);
+            p.scroll_target = p.scroll_target.clamp(0.0, max_scroll);
+            p.scroll_offset    = p.scroll_offset.clamp(0.0, max_scroll);
+        }
+    }
+
+    #[inline]
+    pub fn scroll_by(&mut self, key: &str, delta: f32, content_h: f32, viewport_h: f32) {
+        let k = self.hash_str(key);
+        if let Some(p) = self.persist.get_mut(&k) {
+            let max_scroll = (content_h - viewport_h).max(0.0);
+            let new_target = p.scroll_target + delta;
+
+            if new_target < 0.0 {
+                // overscroll at top
+                p.scroll_target  = 0.0;
+                p.scroll_overscroll = new_target.max(-OVERSCROLL_HEIGHT);
+            } else if new_target > max_scroll {
+                // overscroll at bottom
+                p.scroll_target  = max_scroll;
+                p.scroll_overscroll = (new_target - max_scroll).min(OVERSCROLL_HEIGHT);
+            } else {
+                p.scroll_target  = new_target;
+                p.scroll_overscroll = 0.0;
+            }
+        }
+    }
+
+    #[inline]
     pub fn update_interaction(&mut self, mouse: [f32; 2], clicked: bool) {
-        self.hot_key = 0;
+        self.hot_key = LabelHash(0);
 
         //
         // Walk all boxes, find topmost hovered + hoverable
@@ -290,29 +402,51 @@ impl UiState {
 
         if clicked {
             self.active_key = self.hot_key;
-        } else if self.active_key != 0 {
-            self.active_key = 0;
+        } else if self.active_key != LabelHash(0) {
+            self.active_key = LabelHash(0);
         }
     }
 
     #[inline]
     pub fn tick_animations(&mut self) {
         //
-        // Collect targets first to avoid borrow issues
+        // Collect cursor targets before mutably borrowing persist.
+        // @SmallVecCandidate
         //
-        let targets = self.boxes.values()
+        let cursor_targets = self.boxes.values()
             .filter_map(|b| b.text_input().map(|t| (b.key, t.cursor_target_pixel_offset)))
-            .collect::<Vec<_>>(); // @SmallVecCandidate
+            .collect::<Vec<_>>();
 
         for (key, p) in &mut self.persist {
+            //
+            // Hover or active flashes
+            //
+
             let hot_target    = if *key == self.hot_key    { 1.0 } else { 0.0 };
             let active_target = if *key == self.active_key { 1.0 } else { 0.0 };
+
             p.hot_t    += (hot_target - p.hot_t) * 0.15;
             p.active_t *= 0.75;
             if active_target == 1.0 { p.active_t = 1.0; }
 
-            // Smooth cursor
-            if let Some(&(_, target)) = targets.iter().find(|(k, _)| k == key) {
+            //
+            // Scroll: spring toward target, with overscroll bounce
+            //
+
+            let spring = (p.scroll_target - p.scroll_offset) * 0.12;
+
+            p.scroll_velocity   += spring;
+            p.scroll_velocity   *= 0.82;  // damping
+            p.scroll_offset     += p.scroll_velocity;
+            p.scroll_overscroll *= 0.88; // slow decay for bouncy feel
+            if p.scroll_overscroll.abs() < 0.1 { p.scroll_overscroll = 0.0; }
+            p.scroll_visual = p.scroll_offset + p.scroll_overscroll;
+
+            //
+            // Cursor: lerp toward target pixel offset
+            //
+
+            if let Some(&(_, target)) = cursor_targets.iter().find(|(k, _)| k == key) {
                 p.cursor_visual_x += (target - p.cursor_visual_x) * 0.25;
             }
         }
@@ -320,21 +454,24 @@ impl UiState {
 
     fn pass1_standalone(
         &mut self,
-        key: BoxRef,
-        measure_callback: &mut impl FnMut(&str) -> [f32; 2]
+        id: BoxRef,
+        measure_callback: &mut impl FnMut(&str, f32) -> [f32; 2]
     ) {
-        let children = self.boxes[key].children.clone();
+        let children = self.boxes[id].children.clone();
         for axis in [Axis::X, Axis::Y] {
             let axis = axis as usize;
 
-            let kind = self.boxes[key].pref_size[axis].kind;
+            let kind = self.boxes[id].pref_size[axis].kind;
             match kind {
-                SizeKind::Pixels(v) => self.boxes[key].computed_size[axis] = v,
+                SizeKind::Pixels(v) => self.boxes[id].computed_size[axis] = v,
 
                 SizeKind::TextContent => {
-                    let text = &self.boxes[key].text;
-                    let measured = measure_callback(text);
-                    self.boxes[key].computed_size[axis] = measured[axis];
+                    let text = &self.boxes[id].text;
+                    let font_size = self.boxes[id].font_size;
+                    let pl = self.boxes[id].padding_left;
+                    let pr = self.boxes[id].padding_right;
+                    let measured = measure_callback(&text, font_size);
+                    self.boxes[id].computed_size[axis] = measured[axis] + pl + pr;
                 }
 
                 _ => {}
@@ -346,34 +483,34 @@ impl UiState {
         }
     }
 
-    fn pass2a_parent_pct(&mut self, key: BoxRef, parent_size: [f32; 2]) {
-        let children = self.boxes[key].children.clone();
+    fn pass2a_parent_pct(&mut self, id: BoxRef, parent_size: [f32; 2]) {
+        let children = self.boxes[id].children.clone();
         for axis in [Axis::X, Axis::Y] {
             let axis = axis as usize;
 
-            let kind = self.boxes[key].pref_size[axis].kind;
+            let kind = self.boxes[id].pref_size[axis].kind;
             if let SizeKind::ParentPct(pct) = kind {
-                self.boxes[key].computed_size[axis] = parent_size[axis] * pct;
+                self.boxes[id].computed_size[axis] = parent_size[axis] * pct;
             }
         }
 
-        let my_size = self.boxes[key].computed_size;
+        let my_size = self.boxes[id].computed_size;
         for c in children {
             self.pass2a_parent_pct(c, my_size);
         }
     }
 
-    fn pass2b_children_sum(&mut self, key: BoxRef) {
-        let children = self.boxes[key].children.clone();
+    fn pass2b_children_sum(&mut self, id: BoxRef) {
+        let children = self.boxes[id].children.clone();
         for c in &children {
             self.pass2b_children_sum(*c);
         }
 
-        let child_axis = self.boxes[key].child_axis as usize;
+        let child_axis = self.boxes[id].child_axis as usize;
         for axis in [Axis::X, Axis::Y] {
             let axis = axis as usize;
 
-            let kind = self.boxes[key].pref_size[axis].kind;
+            let kind = self.boxes[id].pref_size[axis].kind;
             if !matches!(kind, SizeKind::ChildrenSum) { continue }
 
             let v = if axis == child_axis {
@@ -382,15 +519,15 @@ impl UiState {
                 children.iter().map(|ck| self.boxes[*ck].computed_size[axis]).fold(0.0_f32, f32::max)
             };
 
-            self.boxes[key].computed_size[axis] = v;
+            self.boxes[id].computed_size[axis] = v;
         }
     }
 
-    fn resolve_overflow(&mut self, key: BoxRef) {
-        let children = self.boxes[key].children.clone();
+    fn resolve_overflow(&mut self, id: BoxRef) {
+        let children = self.boxes[id].children.clone();
 
-        let axis = self.boxes[key].child_axis as usize;
-        let parent_size = self.boxes[key].computed_size[axis];
+        let axis = self.boxes[id].child_axis as usize;
+        let parent_size = self.boxes[id].computed_size[axis];
         let total: f32 = children.iter().map(|ck| self.boxes[*ck].computed_size[axis]).sum();
         let overflow = (total - parent_size).max(0.0);
 
@@ -416,19 +553,28 @@ impl UiState {
         }
     }
 
-    fn pass3_place(&mut self, key: BoxRef, origin: [f32; 2]) {
-        let children = self.boxes[key].children.clone();
+    fn pass3_place(&mut self, id: BoxRef, origin: [f32; 2]) {
+        let children = self.boxes[id].children.clone();
 
-        let axis  = self.boxes[key].child_axis as usize;
+        let axis  = self.boxes[id].child_axis as usize;
         let cross = 1 - axis;
-        let size  = self.boxes[key].computed_size;
+        let size  = self.boxes[id].computed_size;
+        let flags = self.boxes[id].flags;
 
-        self.boxes[key].rect = [
-            origin[0], origin[1],
+        self.boxes[id].rect = [
+            origin[0],           origin[1],
             origin[0] + size[0], origin[1] + size[1],
         ];
 
-        let mut cursor = origin[axis];
+        // Apply scroll offset to children origin
+        let scroll_off = if flags.contains(BoxFlags::SCROLL_CHILDREN) {
+            let k = self.boxes[id].key;
+            self.persist.get(&k).map(|p| p.scroll_visual).unwrap_or(0.0)
+        } else {
+            0.0
+        };
+
+        let mut cursor = origin[axis] - scroll_off;
         for c in children {
             let child_size = self.boxes[c].computed_size;
             let mut child_origin = origin;
@@ -456,7 +602,7 @@ impl UiState {
 #[inline]
 pub fn render(ui: &UiState, gpu: &mut Gpu) {
     if let Some(root) = ui.root {
-        render_box(ui, gpu, root);
+        render_box(root, ui, gpu);
     }
 }
 
@@ -470,8 +616,8 @@ fn lerp_color(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
     [lerp(a[0],b[0],t), lerp(a[1],b[1],t), lerp(a[2],b[2],t), lerp(a[3],b[3],t)]
 }
 
-fn render_box(ui: &UiState, gpu: &mut Gpu, key: BoxRef) {
-    let b = &ui.boxes[key];
+fn render_box(id: BoxRef, ui: &UiState, gpu: &mut Gpu) {
+    let b = &ui.boxes[id];
     let [x0, y0, x1, y1] = b.rect;
     let (x, y, w, h) = (x0, y0, x1 - x0, y1 - y0);
 
@@ -480,48 +626,59 @@ fn render_box(ui: &UiState, gpu: &mut Gpu, key: BoxRef) {
     let active_t = persist.map(|p| p.active_t).unwrap_or(0.0);
 
     if b.flags.contains(BoxFlags::DRAW_BG) {
-        let c = lerp_color(b.bg_color.into(), b.hover_color.into(), hot_t);
+        let color = if b.hover_color.a > 0 {
+            lerp_color(b.bg_color.into(), b.hover_color.into(), hot_t)
+        } else {
+            b.bg_color.into()
+        };
+
         let flash = active_t * 0.15;
-        let c = [
-            (c[0] + flash).min(1.0),
-            (c[1] + flash).min(1.0),
-            (c[2] + flash).min(1.0),
-            (c[3])
+        let flashed_color = [
+            (color[0] + flash).min(1.0),
+            (color[1] + flash).min(1.0),
+            (color[2] + flash).min(1.0),
+            (color[3])
         ].into();
-        crate::gpu::draw_rect(gpu, x, y, w, h, c);
+
+        crate::gpu::draw_rect(gpu, x, y, w, h, flashed_color);
     }
 
     //
     // 1px border on bottom edge only
     //
     if b.flags.contains(BoxFlags::DRAW_BORDER) {
-        // bottom border
+        // Bottom border
         crate::gpu::draw_rect(gpu, x, y + h - 1.0, w, 1.0, b.border_color);
-        // left border
+        // Left border
         crate::gpu::draw_rect(gpu, x, y, 1.0, h, b.border_color);
     }
 
     if b.flags.contains(BoxFlags::DRAW_TEXT) {
         let pad = b.padding;
-        let text_y = y + h * 0.5 + gpu.font_scale * 5.0;
+        let text_x = x + b.padding_left;
+        let text_y = y + h * 0.5 + b.font_size * 0.35;
 
-        if !b.text.is_empty() {
-            crate::gpu::draw_text(gpu, &b.text, x + pad, text_y, b.text_color);
+        let display_text = b.text.find("##") // Strip ##
+            .map(|i| &b.text[..i])
+            .unwrap_or(&b.text);
+
+        if !display_text.is_empty() {
+            crate::gpu::draw_text(gpu, display_text, text_x, text_y, b.font_size, b.text_color);
         }
 
         if let BoxCustom::TextInput(TextInputInfo {
             cursor_pixel_offset,
-            cursor_target_pixel_offset,
             cursor_idle_secs,
-            cursor_char
+            cursor_char,
+            ..
         }) = b.custom {
             // Use smoothed position from persist, fall back to raw offset
             let smooth_x = persist
                 .map(|p| p.cursor_visual_x)
                 .unwrap_or(cursor_pixel_offset);
 
-            let cursor_w = 8.0  * gpu.font_scale;
-            let cursor_h = 14.0 * gpu.font_scale;
+            let cursor_w = b.font_size * 0.57; // roughly one char width
+            let cursor_h = b.font_size;
             let cursor_x = x + pad + smooth_x;
             let cursor_y = y + (h - cursor_h) * 0.5;
 
@@ -549,6 +706,7 @@ fn render_box(ui: &UiState, gpu: &mut Gpu, key: BoxRef) {
                         &ch.to_string(),
                         cursor_x,
                         text_y,
+                        b.font_size,
                         Color::rgba(8, 8, 10, 255)
                     );
                 }
@@ -556,40 +714,53 @@ fn render_box(ui: &UiState, gpu: &mut Gpu, key: BoxRef) {
         }
     }
 
+    if b.flags.contains(BoxFlags::CLIP_CHILDREN) {
+        crate::gpu::push_clip(gpu, x, y, w, h);
+    }
+
     for &child in &b.children {
-        render_box(ui, gpu, child);
+        render_box(child, ui, gpu);
+    }
+
+    if b.flags.contains(BoxFlags::CLIP_CHILDREN) {
+        crate::gpu::pop_clip(gpu);
     }
 }
-
 
 pub struct BoxBuilder<'a> {
     ui:           &'a mut UiState,
 
-    key:          u64,
+    label_hash:    LabelHash,
 
-    flags:        BoxFlags,
-    size_x:       Option<Size>,
-    size_y:       Option<Size>,
-    bg:           Option<Color>,
-    color:        Option<Color>,
-    hover_color:  Option<Color>,
-    border_color: Option<Color>,
-    axis:         Option<Axis>,
-    text:         Option<String>,
-    padding:      Option<f32>,
+    flags:         BoxFlags,
+    size_x:        Option<Size>,
+    size_y:        Option<Size>,
+    bg:            Option<Color>,
+    color:         Option<Color>,
+    font_size:     Option<f32>,
+    hover_color:   Option<Color>,
+    border_color:  Option<Color>,
+    axis:          Option<Axis>,
+    text:          Option<Boxed<str>>,
+    padding:       Option<f32>,  // @Cleanup
+    padding_left:  Option<f32>,
+    padding_right: Option<f32>,
 }
 
 impl<'a> BoxBuilder<'a> {
     #[inline]
     fn new(ui: &'a mut UiState, key: &str, flags: BoxFlags) -> Self {
         Self {
-            ui,
-            key: hash_str(key),
-            flags,
+            label_hash: ui.hash_str(key),
             padding: None,
             size_x: None, size_y: None,
+            font_size: None,
             bg: None, color: None, hover_color: None, border_color: None, axis: None,
             text: None,
+            padding_right: None, padding_left: None,
+
+            ui,
+            flags,
         }
     }
 
@@ -612,6 +783,17 @@ impl<'a> BoxBuilder<'a> {
         self
     }
 
+    //
+    // NOTE: This expects an already scaled font size,
+    // meaning that this is the FINAL pixel size, and
+    // there will not be any mutation of it downstream.
+    //
+    #[inline]
+    pub fn font_size(mut self, s: f32) -> Self {
+        self.font_size = Some(s);
+        self
+    }
+
     #[inline]
     pub fn border(mut self, c: Color) -> Self {
         self.border_color = Some(c);
@@ -626,12 +808,19 @@ impl<'a> BoxBuilder<'a> {
 
     #[inline]
     pub fn padding(mut self, p: f32) -> Self {
-        self.padding = Some(p);
+        self.padding = Some(p); // @Cleanup
         self
     }
 
     #[inline]
-    pub fn text(mut self, t: impl Into<String>) -> Self {
+    pub fn padding_x(mut self, left: f32, right: f32) -> Self {
+        self.padding_left  = Some(left);
+        self.padding_right = Some(right);
+        self
+    }
+
+    #[inline]
+    pub fn text(mut self, t: impl Into<Boxed<str>>) -> Self {
         self.text = Some(t.into());
         self
     }
@@ -639,16 +828,16 @@ impl<'a> BoxBuilder<'a> {
     // terminal, no children
     #[inline]
     pub fn build(self) -> BoxRef {
-        self.build_inner(None::<fn(&mut UiState)>)
+        self.build_impl(None::<fn(&mut UiState)>)
     }
 
     // container, has children via closure
     #[inline]
     pub fn build_children(self, f: impl FnOnce(&mut UiState)) -> BoxRef {
-        self.build_inner(Some(f))
+        self.build_impl(Some(f))
     }
 
-    fn build_inner(self, f: Option<impl FnOnce(&mut UiState)>) -> BoxRef {
+    fn build_impl(self, f: Option<impl FnOnce(&mut UiState)>) -> BoxRef {
         let ui = self.ui;
 
         // Push stacks
@@ -658,11 +847,19 @@ impl<'a> BoxBuilder<'a> {
         if let Some(c) = self.color  { ui.stacks.text_color.push(c) }
         if let Some(a) = self.axis   { ui.stacks.child_axis.push(a) }
         if let Some(p) = self.padding { ui.stacks.padding.push(p); }
+        if let Some(p) = self.padding_left { ui.stacks.padding_left.push(p); }
+        if let Some(p) = self.padding_right { ui.stacks.padding_right.push(p); }
 
-        let id = ui.push_box(self.key, self.flags);
+        let id = ui.push_box(self.label_hash, self.flags);
 
-        // hover_color set directly since it's not a stack
-        if let Some(c) = self.hover_color { ui.boxes[id].hover_color = c }
+        // Set these directly since they're not a stack
+        if let Some(c) = self.hover_color {
+            ui.boxes[id].hover_color = c;
+            ui.boxes[id].flags |= BoxFlags::HOVERABLE;
+        }
+        if let Some(s) = self.font_size {
+            ui.boxes[id].font_size = s;
+        }
         if let Some(c) = self.border_color {
             ui.boxes[id].border_color = c;
             ui.boxes[id].flags |= BoxFlags::DRAW_BORDER;
@@ -674,19 +871,23 @@ impl<'a> BoxBuilder<'a> {
             ui.boxes[id].flags |= BoxFlags::DRAW_TEXT;
         }
 
+        // Pop bg BEFORE building children so they don't inherit it
+        if self.bg.is_some() { ui.stacks.bg_color.pop(); }
+
         if let Some(f) = f {
             ui.push_parent(id);
             f(ui);
             ui.pop_parent();
         }
 
-        // Pop stacks
-        if self.size_x.is_some() { ui.stacks.size_x.pop(); }
-        if self.size_y.is_some() { ui.stacks.size_y.pop(); }
-        if self.bg.is_some()     { ui.stacks.bg_color.pop(); }
-        if self.color.is_some()  { ui.stacks.text_color.pop(); }
-        if self.axis.is_some()   { ui.stacks.child_axis.pop(); }
-        if self.padding.is_some() { ui.stacks.padding.pop(); }
+        // Pop remaining stacks after children
+        _ = ui.stacks.size_x.pop();
+        _ = ui.stacks.size_y.pop();
+        _ = ui.stacks.text_color.pop();
+        _ = ui.stacks.child_axis.pop();
+        _ = ui.stacks.padding.pop();
+        _ = ui.stacks.padding_left.pop();
+        _ = ui.stacks.padding_right.pop();
 
         id
     }
@@ -748,13 +949,13 @@ impl UiState {
             Axis::Y => (Size::fill(), sz),
         };
         self.push_size(sx, sy);
-        self.push_box(hash_str(key), BoxFlags::empty());
+        self.push_box(self.hash_str(key), BoxFlags::empty());
         self.pop_size();
     }
 
     // layout - runs all three passes from the root
     #[inline]
-    pub fn layout(&mut self, mut measure_callback: impl FnMut(&str) -> [f32; 2]) {
+    pub fn layout(&mut self, mut measure_callback: impl FnMut(&str, f32) -> [f32; 2]) {
         if let Some(root) = self.root {
             let win = [self.win_w, self.win_h];
             self.pass1_standalone(root, &mut measure_callback);
@@ -769,12 +970,4 @@ impl UiState {
     pub fn tick(&mut self) {
         self.tick_animations();
     }
-}
-
-pub fn hash_str(s: &str) -> u64 {
-    use std::hash::{Hash, Hasher, DefaultHasher};
-    let mut h = DefaultHasher::new();
-    let key_part = s.find("##").map(|i| &s[..i]).unwrap_or(s);
-    key_part.hash(&mut h);
-    h.finish()
 }

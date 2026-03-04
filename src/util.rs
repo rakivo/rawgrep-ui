@@ -3,3 +3,8 @@
 pub fn px(x: f32, y: f32, sw: f32, sh: f32) -> [f32; 2] {
     [(x / sw) * 2.0 - 1.0, 1.0 - (y / sh) * 2.0]
 }
+
+#[inline]
+pub fn size_key(px: f32) -> u32 {
+    (px * 10.0) as u32
+}
