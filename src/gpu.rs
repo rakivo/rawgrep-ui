@@ -1,66 +1,15 @@
-use std::collections::HashMap;
-use std::ops::Deref;
-use std::sync::Arc;
-use winit::window::Window;
-
-use crate::Color;
+use crate::color::{GpuColor, Color};
+use crate::palette;
 use crate::util::px;
 
-const ATLAS_SIZE:   u32 = 512;
-const FONT_SIZE:    f32 = 24.0;
+use std::sync::Arc;
+use std::collections::HashMap;
+
+use winit::window::Window;
+
+pub const FONT_SIZE: f32 = 14.0;
+const ATLAS_SIZE:  u32 = 512;
 const VTX_BUF_CAP: u64 = 64 * 1024;
-
-#[repr(transparent)]
-#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct GpuColor(pub [f32; 4]);
-
-impl From<[f32; 4]> for GpuColor {
-    fn from(value: [f32; 4]) -> Self {
-        Self(value)
-    }
-}
-
-impl From<Color> for GpuColor {
-    fn from(Color { r, g, b, a}: Color) -> Self {
-        Self::rgba(r, g, b, a)
-    }
-}
-
-impl Deref for GpuColor {
-    type Target = [f32; 4];
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl Default for GpuColor {
-    fn default() -> Self {
-        Self::rgba(238, 130, 238, 255)
-    }
-}
-
-impl GpuColor {
-    #[inline]
-    pub fn rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
-        Self([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a as f32 / 255.0])
-    }
-
-    #[inline]
-    pub fn hsv(h: f32, s: f32, v: f32) -> Self {
-        let i = (h * 6.0) as u32;
-        let f = h * 6.0 - i as f32;
-        let (p, q, t) = (v*(1.0-s), v*(1.0-s*f), v*(1.0-s*(1.0-f)));
-        let (r, g, b) = match i % 6 {
-            0 => (v, t, p),
-            1 => (q, v, p),
-            2 => (p, v, t),
-            3 => (p, q, v),
-            4 => (t, p, v),
-            _ => (v, p, q),
-        };
-        Self([r, g, b, 1.0])
-    }
-}
 
 #[derive(Default, Clone, Copy)]
 pub struct Glyph {
@@ -80,6 +29,8 @@ pub struct Vert {
 }
 
 pub struct Gpu {
+    pub font_scale: f32,
+
     pub surface:        wgpu::Surface<'static>,
     pub surface_config: wgpu::SurfaceConfiguration,
     pub device:         wgpu::Device,
@@ -99,6 +50,14 @@ pub struct Gpu {
     pub font:           fontdue::Font,
 
     pub verts:          Vec<Vert>,
+    pub vtx_buf_cap:    u64
+}
+
+impl Gpu {
+    #[inline]
+    pub fn scaled_font_size(&self) -> f32 {
+        FONT_SIZE * self.font_scale
+    }
 }
 
 pub fn init(window: Arc<Window>) -> Gpu {
@@ -110,24 +69,34 @@ async fn init_async(window: Arc<Window>) -> Gpu {
     let (w, h) = (size.width.max(1), size.height.max(1));
 
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::VULKAN, ..Default::default()
+        backends: wgpu::Backends::VULKAN,
+        ..Default::default()
     });
+
     let surface = instance.create_surface(window).unwrap();
+
     let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
-        compatible_surface: Some(&surface), ..Default::default()
+        compatible_surface: Some(&surface),
+        ..Default::default()
     }).await.unwrap();
+
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor::default())
-        .await.unwrap();
+        .await
+        .unwrap();
 
-    let caps   = surface.get_capabilities(&adapter);
-    let format = caps.formats.iter().find(|f| f.is_srgb()).copied().unwrap_or(caps.formats[0]);
+    let caps = surface.get_capabilities(&adapter);
+    let format = caps.formats.iter()
+        .find(|f| **f == wgpu::TextureFormat::Bgra8Unorm)
+        .copied()
+        .unwrap_or(caps.formats[0]);
+
     let surface_config = wgpu::SurfaceConfiguration {
         usage:                         wgpu::TextureUsages::RENDER_ATTACHMENT,
         format, width: w, height: h,
         present_mode:                  wgpu::PresentMode::Fifo,
         alpha_mode:                    caps.alpha_modes[0],
-        view_formats:                  vec![],
+        view_formats:                  Vec::new(),
         desired_maximum_frame_latency: 2,
     };
     surface.configure(&device, &surface_config);
@@ -217,13 +186,21 @@ async fn init_async(window: Arc<Window>) -> Gpu {
     let font = fontdue::Font::from_bytes(font_bytes.as_ref(), fontdue::FontSettings::default()).unwrap();
 
     Gpu {
-        surface, surface_config, device, queue,
-        win_w: w as f32, win_h: h as f32,
-        pipeline, bind_group, vtx_buf,
-        atlas_tex, atlas_cur_x: 1, atlas_cur_y: 1, atlas_row_h: 0,
-        glyphs: HashMap::new(),
         font,
+
+        font_scale: 1.0,
+
+        surface, surface_config, device, queue,
+
+        win_w: w as f32, win_h: h as f32,
+
+        pipeline, bind_group, vtx_buf,
+
+        atlas_tex, atlas_cur_x: 1, atlas_cur_y: 1, atlas_row_h: 0,
+
+        glyphs: HashMap::new(),
         verts: Vec::new(),
+        vtx_buf_cap: VTX_BUF_CAP
     }
 }
 
@@ -232,9 +209,11 @@ async fn init_async(window: Arc<Window>) -> Gpu {
 //
 
 pub fn get_glyph(gpu: &mut Gpu, c: char) -> Option<Glyph> {
-    if let Some(g) = gpu.glyphs.get(&c) { return Some(*g); }
+    if let Some(g) = gpu.glyphs.get(&c) {
+        return Some(*g);
+    }
 
-    let (metrics, bitmap) = gpu.font.rasterize(c, FONT_SIZE);
+    let (metrics, bitmap) = gpu.font.rasterize(c, gpu.scaled_font_size());
 
     if metrics.width == 0 || metrics.height == 0 {
         let g = Glyph { advance: metrics.advance_width, ..Default::default() };
@@ -248,7 +227,10 @@ pub fn get_glyph(gpu: &mut Gpu, c: char) -> Option<Glyph> {
         gpu.atlas_cur_x  = 1;
         gpu.atlas_row_h  = 0;
     }
-    if gpu.atlas_cur_y + h + 1 > ATLAS_SIZE { eprintln!("atlas full"); return None; }
+    if gpu.atlas_cur_y + h + 1 > ATLAS_SIZE {
+        eprintln!("atlas full");
+        return None;
+    }
 
     gpu.queue.write_texture(
         wgpu::TexelCopyTextureInfo {
@@ -274,7 +256,9 @@ pub fn get_glyph(gpu: &mut Gpu, c: char) -> Option<Glyph> {
 
     gpu.atlas_cur_x += w + 1;
     if h > gpu.atlas_row_h { gpu.atlas_row_h = h; }
+
     gpu.glyphs.insert(c, g);
+
     Some(g)
 }
 
@@ -318,8 +302,8 @@ pub fn draw_text_colored(
         let color: GpuColor = color_callback(i).into();
 
         if g.w > 0 && g.h > 0 {
-            let gx = x + g.bearing_x as f32;
-            let gy = y - g.bearing_y as f32 - g.h as f32;
+            let gx = (x + g.bearing_x as f32).round();
+            let gy = (y - g.bearing_y as f32 - g.h as f32).round();
 
             let [x0, y0] = px(gx,              gy,              sw, sh);
             let [x1, y1] = px(gx + g.w as f32, gy + g.h as f32, sw, sh);
@@ -348,6 +332,7 @@ pub fn draw_text_colored(
 }
 
 // Flat color convenience wrapper
+#[inline]
 pub fn draw_text(gpu: &mut Gpu, text: &str, x: f32, y: f32, color: Color) {
     draw_text_colored(gpu, text, x, y, |_| color);
 }
@@ -357,11 +342,30 @@ pub fn draw_text(gpu: &mut Gpu, text: &str, x: f32, y: f32, color: Color) {
 //
 
 pub fn submit(gpu: &mut Gpu) -> Result<(), wgpu::SurfaceError> {
-    if !gpu.verts.is_empty() {
+    let byte_size = (gpu.verts.len() * std::mem::size_of::<Vert>()) as u64;
+
+    if byte_size > 0 {
+        if byte_size > gpu.vtx_buf_cap {
+            //
+            // Recreate buffer only if needed
+            //
+            let new_cap = (byte_size * 2).max(VTX_BUF_CAP); // at least VTX_BUF_CAP
+            gpu.vtx_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: new_cap,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            gpu.vtx_buf_cap = new_cap;
+        }
+
         gpu.queue.write_buffer(&gpu.vtx_buf, 0, bytemuck::cast_slice(&gpu.verts));
     }
+
     let vtx_count = gpu.verts.len() as u32;
     gpu.verts.clear();
+
+    let palette = palette();
 
     let output = gpu.surface.get_current_texture()?;
     let view   = output.texture.create_view(&Default::default());
@@ -370,7 +374,7 @@ pub fn submit(gpu: &mut Gpu) -> Result<(), wgpu::SurfaceError> {
         let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 ops: wgpu::Operations {
-                    load:  wgpu::LoadOp::Clear(wgpu::Color { r:0.08, g:0.08, b:0.10, a:1.0 }),
+                    load:  wgpu::LoadOp::Clear(palette.bg.into()),
                     store: wgpu::StoreOp::Store,
                 },
 
