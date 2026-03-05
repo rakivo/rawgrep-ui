@@ -1,5 +1,3 @@
-#![allow(unused)]
-
 use crate::color::Color;
 use crate::gpu::{FONT_SIZE, Gpu};
 
@@ -12,7 +10,6 @@ use std::collections::HashMap;
 use smallvec::SmallVec;
 use cranelift_entity::PrimaryMap;
 
-const OVERSCROLL_HEIGHT: f32 = 80.0;
 const DEFAULT_PADDING: f32 = 4.0;
 
 #[derive(Eq, PartialEq, PartialOrd, Copy, Clone, Debug, Hash)]
@@ -90,8 +87,9 @@ pub struct Box {
     pub padding_right: f32,
 
     // Layout OUTPUT
-    pub rect:          [f32; 4], // x0, y0, x1, y1
-    pub computed_size: [f32; 2], // w, h
+    pub rect:          [f32; 4],         // x0, y0, x1, y1
+    pub computed_size: [f32; 2],         // w, h
+    pub clip_rect:     Option<[f32; 4]>, // x0, y0, y1, y1
 
     pub custom: BoxCustom,
 }
@@ -115,6 +113,7 @@ impl Default for Box {
             text_color:    Color::rgba(255, 255, 255, 255),
             computed_size: [0.0; 2],
             rect:          [0.0; 4],
+            clip_rect:     None,
             font_size:     FONT_SIZE,
             custom:        Default::default(),
         }
@@ -357,7 +356,7 @@ impl UiState {
         if let Some(p) = self.persist.get_mut(&k) {
             let max_scroll = (content_h - viewport_h).max(0.0);
             p.scroll_target = p.scroll_target.clamp(0.0, max_scroll);
-            p.scroll_offset    = p.scroll_offset.clamp(0.0, max_scroll);
+            p.scroll_offset  = p.scroll_offset.clamp(0.0, max_scroll);
         }
     }
 
@@ -368,17 +367,15 @@ impl UiState {
             let max_scroll = (content_h - viewport_h).max(0.0);
             let new_target = p.scroll_target + delta;
 
+            p.scroll_target = new_target.clamp(0.0, max_scroll);
+
+            // overscroll only when hitting a hard boundary
             if new_target < 0.0 {
-                // overscroll at top
-                p.scroll_target  = 0.0;
-                p.scroll_overscroll = new_target.max(-OVERSCROLL_HEIGHT);
+                p.scroll_overscroll = new_target.max(-120.0);
             } else if new_target > max_scroll {
-                // overscroll at bottom
-                p.scroll_target  = max_scroll;
-                p.scroll_overscroll = (new_target - max_scroll).min(OVERSCROLL_HEIGHT);
+                p.scroll_overscroll = (new_target - max_scroll).min(120.0);
             } else {
-                p.scroll_target  = new_target;
-                p.scroll_overscroll = 0.0;
+                p.scroll_overscroll = 0.0;  // clear it when scrolling normally
             }
         }
     }
@@ -387,16 +384,25 @@ impl UiState {
     pub fn update_interaction(&mut self, mouse: [f32; 2], clicked: bool) {
         self.hot_key = LabelHash(0);
 
-        //
-        // Walk all boxes, find topmost hovered + hoverable
-        //
-        for b in self.boxes.values() {
+        // Iterate in reverse so last-rendered (topmost) boxes win,
+        // and break on first hit.
+        for b in self.boxes.values().rev() {
             if !b.flags.contains(BoxFlags::HOVERABLE) { continue }
 
             let [x0, y0, x1, y1] = b.rect;
-            if mouse[0] >= x0 && mouse[0] <= x1
-            && mouse[1] >= y0 && mouse[1] <= y1 {
+
+            // Clip to scroll parent's visible rect if one exists
+            let [cx0, cy0, cx1, cy1] = b.clip_rect.unwrap_or([x0, y0, x1, y1]);
+
+            let mx = mouse[0];
+            let my = mouse[1];
+
+            if mx >= x0 && mx <= x1
+            && my >= y0 && my <= y1
+            && mx >= cx0 && mx <= cx1
+            && my >= cy0 && my <= cy1 {
                 self.hot_key = b.key;
+                break;
             }
         }
 
@@ -436,9 +442,11 @@ impl UiState {
             let spring = (p.scroll_target - p.scroll_offset) * 0.12;
 
             p.scroll_velocity   += spring;
-            p.scroll_velocity   *= 0.82;  // damping
-            p.scroll_offset     += p.scroll_velocity;
-            p.scroll_overscroll *= 0.88; // slow decay for bouncy feel
+            p.scroll_velocity   *= 0.72;  // damping
+            p.scroll_offset += (p.scroll_target - p.scroll_offset) * 0.25;
+
+            // overscroll bounces back
+            p.scroll_overscroll *= 0.82;
             if p.scroll_overscroll.abs() < 0.1 { p.scroll_overscroll = 0.0; }
             p.scroll_visual = p.scroll_offset + p.scroll_overscroll;
 
@@ -553,7 +561,7 @@ impl UiState {
         }
     }
 
-    fn pass3_place(&mut self, id: BoxRef, origin: [f32; 2]) {
+    fn pass3_place(&mut self, id: BoxRef, origin: [f32; 2], clip: Option<[f32; 4]>) {
         let children = self.boxes[id].children.clone();
 
         let axis  = self.boxes[id].child_axis as usize;
@@ -561,10 +569,12 @@ impl UiState {
         let size  = self.boxes[id].computed_size;
         let flags = self.boxes[id].flags;
 
-        self.boxes[id].rect = [
+        let rect = [
             origin[0],           origin[1],
             origin[0] + size[0], origin[1] + size[1],
         ];
+        self.boxes[id].rect      = rect;
+        self.boxes[id].clip_rect = clip;
 
         // Apply scroll offset to children origin
         let scroll_off = if flags.contains(BoxFlags::SCROLL_CHILDREN) {
@@ -574,13 +584,20 @@ impl UiState {
             0.0
         };
 
+        // If this box clips its children, it becomes the new clip rect
+        let child_clip = if flags.contains(BoxFlags::CLIP_CHILDREN) {
+            Some(rect)
+        } else {
+            clip
+        };
+
         let mut cursor = origin[axis] - scroll_off;
         for c in children {
             let child_size = self.boxes[c].computed_size;
             let mut child_origin = origin;
             child_origin[axis]  = cursor;
             child_origin[cross] = origin[cross];
-            self.pass3_place(c, child_origin);
+            self.pass3_place(c, child_origin, child_clip);
             cursor += child_size[axis];
         }
     }
@@ -962,7 +979,7 @@ impl UiState {
             self.pass2a_parent_pct(root, win);
             self.pass2b_children_sum(root);
             self.resolve_overflow(root);
-            self.pass3_place(root, [0.0, 0.0]);
+            self.pass3_place(root, [0.0, 0.0], None);
         }
     }
 

@@ -3,19 +3,22 @@ mod gpu;
 mod util;
 mod color;
 mod prompt;
+mod search;
 
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
+use std::time::Instant;
 
+use gpu::Gpu;
 use color::Color;
 use prompt::PromptState;
-use ui::{BoxCustom, Size, TextInputInfo, UiState};
-use winit::{
-    application::ApplicationHandler,
-    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    keyboard::{Key, KeyCode, PhysicalKey},
-    window::{Window, WindowId},
-};
+use search::SearchManager;
+use ui::{BoxCustom, BoxRef, Size, TextInputInfo, UiState};
+
+use winit::window::{Window, WindowId};
+use winit::application::ApplicationHandler;
+use winit::keyboard::{Key, KeyCode, PhysicalKey};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 
 const MIN_SCALE: f32 = 0.75;
 const MAX_SCALE: f32 = 5.00;
@@ -24,12 +27,12 @@ const PROMPT_PREFIX: &str = "> ";
 
 const BASE_SCALE: f32 = 1.45;
 
-const TITLE_BASE_FONT_SIZE: f32 = 11.0;
+const TITLE_BASE_FONT_SIZE:  f32 = 11.0;
 const PROMPT_BASE_FONT_SIZE: f32 = 13.0;
 const SEARCH_BASE_FONT_SIZE: f32 = 15.0;
 const RESULT_BASE_FONT_SIZE: f32 = 12.0;
 
-const TITLE_BASE_ROW_HEIGHT: f32 = 18.0;
+const TITLE_BASE_ROW_HEIGHT:  f32 = 18.0;
 const PROMPT_BASE_ROW_HEIGHT: f32 = 28.0;
 const SEARCH_BASE_ROW_HEIGHT: f32 = 27.0;
 const RESULT_BASE_ROW_HEIGHT: f32 = 20.0;
@@ -38,7 +41,6 @@ pub struct Palette {
     pub bg:         Color,
     pub header_bar: Color,
     pub prompt_box: Color,
-
     pub accent:     Color,   // highlighted text, filenames
     pub dim:        Color,   // muted text, prompt prefix
     pub hover:      Color,   // hover overlay for clickable rows
@@ -58,7 +60,7 @@ pub fn palette() -> Palette {
     }
 }
 
-struct User {
+struct UserState {
     scale: f32,
 
     mouse_pos: [f32; 2],
@@ -66,10 +68,12 @@ struct User {
 
     last_keypress: Instant,
 
+    search_btn_ref: Option<BoxRef>,
+
     prompt: PromptState,
 }
 
-impl User {
+impl UserState {
     fn new() -> Self {
         let now = Instant::now();
         Self {
@@ -78,11 +82,18 @@ impl User {
             mouse_pos:      [0.0; 2],
             last_keypress:  now,
             prompt:         Default::default(),
+            search_btn_ref: None
         }
     }
 }
 
-fn build_ui(ui: &mut UiState, user: &User, gpu: &mut gpu::Gpu, cursor_idle_secs: f32) {
+fn build_ui(
+    ui: &mut UiState,
+    user: &mut UserState,
+    gpu: &mut Gpu,
+    search: &SearchManager,
+    cursor_idle_secs: f32
+) {
     let scale = user.scale;
     let palette = palette();
 
@@ -152,38 +163,25 @@ fn build_ui(ui: &mut UiState, user: &User, gpu: &mut gpu::Gpu, cursor_idle_secs:
         .padding(scale * 15.0)
         .border(palette.border)
         .build_children(|ui| {
-            ui.button("search##btn")
+            user.search_btn_ref = ui.button("search##btn")
                 .size(Size::px(80.0 * scale), Size::fill())
                 .bg(Color::rgba(28, 40, 58, 255))
                 .hover_color(Color::rgba(40, 58, 85, 255))
                 .text("search")
                 .font_size(search_font_size)
-                .build();
+                .build()
+                .into();
         });
 
-    let mock_results = [
-        ("src/main.rs",   42,  "    let result = grep(pattern, &path);"),
-        ("src/lib.rs",    17,  "    pub fn search(q: &str) -> Vec<Match> {"),
-        ("src/grep.rs",   88,  "    if line.contains(pattern) {"),
-        ("src/util.rs",   3,   "use std::path::PathBuf;"),
-        ("src/main.rs",   99,  "    for entry in walkdir::WalkDir::new(root) {"),
-        ("src/grep.rs",   112, "        results.push(Match { line, path });"),
-        ("src/lib.rs",    55,  "    let mut buf = String::new();"),
-        ("src/main.rs",   7,   "mod grep;"),
-        ("src/util.rs",   21,  "pub fn canonicalize(p: &Path) -> PathBuf {"),
-        ("src/grep.rs",   44,  "        let line = line?;"),
-        ("src/main.rs",   63,  "    eprintln!(\"error: {}\", e);"),
-        ("src/lib.rs",    78,  "        file.read_to_string(&mut buf)?;"),
-        ("src/grep.rs",   5,   "use std::io::BufRead;"),
-        ("src/util.rs",   33,  "    path.canonicalize().unwrap_or(p.to_owned())"),
-        ("src/main.rs",   101, "        let path = entry?.path().to_owned();"),
-    ];
-
     ui.scroll("results")
-    .size(Size::fill(), Size::children())
+    .size(Size::fill(), Size::fill())
     .bg(palette.bg)
     .build_children(|ui| {
-        for (i, (filename, line_num, text)) in mock_results.iter().enumerate() {
+        for (i, m) in search.results.iter().enumerate() {
+            let filename = String::from_utf8_lossy(&m.path);
+            let line_num = m.line_num;
+            let text     = String::from_utf8_lossy(&m.text);
+
             ui.row(&format!("result_{i}"))
                 .size(Size::fill(), Size::px(result_h))
                 .bg(if i % 2 == 0 { Color::rgba(15,15,15,255) } else { Color::rgba(18,18,18,255) })
@@ -193,7 +191,7 @@ fn build_ui(ui: &mut UiState, user: &User, gpu: &mut gpu::Gpu, cursor_idle_secs:
                         .size(Size::px(120.0 * scale), Size::fill())
                         .font_size(result_font_size)
                         .padding(6.0 * scale)
-                        .text(*filename)
+                        .text(filename)
                         .color(palette.accent)
                         .build();
 
@@ -209,7 +207,7 @@ fn build_ui(ui: &mut UiState, user: &User, gpu: &mut gpu::Gpu, cursor_idle_secs:
                         .size(Size::fill(), Size::fill())
                         .font_size(result_font_size)
                         .padding(6.0 * scale)
-                        .text(*text)
+                        .text(text)
                         .build();
                 });
         }
@@ -225,10 +223,21 @@ fn build_ui(ui: &mut UiState, user: &User, gpu: &mut gpu::Gpu, cursor_idle_secs:
 #[derive(Default)]
 struct App {
     window: Option<Arc<Window>>,
-    ui:     Option<ui::UiState>,
-    gpu:    Option<gpu::Gpu>,
-    user:   Option<User>,
+    ui:     Option<UiState>,
+    gpu:    Option<Gpu>,
+    user:   Option<UserState>,
+    search: Option<SearchManager>,
     mods:   winit::event::Modifiers,
+}
+
+impl App {
+    /// Fire a search for the current prompt contents.
+    fn trigger_search(user: &UserState, search: &mut SearchManager) {
+        let pattern = user.prompt.buffer();
+        if pattern.is_empty() { return }
+
+        search.start(pattern, ".");
+    }
 }
 
 impl ApplicationHandler for App {
@@ -245,7 +254,8 @@ impl ApplicationHandler for App {
 
         self.gpu    = Some(gpu::init(Arc::clone(&win)));
         self.ui     = Some(UiState::new(w as _, h as _));
-        self.user   = Some(User::new());
+        self.user   = Some(UserState::new());
+        self.search = Some(SearchManager::spawn());
         self.window = Some(win);
     }
 
@@ -258,8 +268,10 @@ impl ApplicationHandler for App {
         let (
             Some(gpu),
             Some(user),
-            Some(win)
-        ) = (&mut self.gpu, &mut self.user, &self.window) else { return };
+            Some(ui),
+            Some(search),
+            Some(win),
+        ) = (&mut self.gpu, &mut self.user, &mut self.ui, &mut self.search, &self.window) else { return };
 
         match event {
             WindowEvent::CloseRequested => el.exit(),
@@ -276,6 +288,10 @@ impl ApplicationHandler for App {
 
                 match event.physical_key {
                     PhysicalKey::Code(KeyCode::Escape) => el.exit(),
+
+                    PhysicalKey::Code(KeyCode::Enter) => {
+                        Self::trigger_search(user, search);
+                    }
 
                     PhysicalKey::Code(KeyCode::Space)      => user.prompt.push_char(' '),
                     PhysicalKey::Code(KeyCode::Backspace)  => if ctrl {
@@ -304,8 +320,8 @@ impl ApplicationHandler for App {
                             }
                         } else if alt {
                             match event.physical_key {
-                                PhysicalKey::Code(KeyCode::KeyF) => user.prompt.move_word_forward(), // M-f
-                                PhysicalKey::Code(KeyCode::KeyB) => user.prompt.move_word_back(),    // M-b
+                                PhysicalKey::Code(KeyCode::KeyF) => user.prompt.move_word_forward(),  // M-f
+                                PhysicalKey::Code(KeyCode::KeyB) => user.prompt.move_word_back(),     // M-b
                                 _ => {}
                             }
                         } else if let Key::Character(s) = &event.logical_key {
@@ -316,7 +332,7 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                let result_count = 15; // ...
+                let result_count = search.results.len();
                 let result_h     = RESULT_BASE_ROW_HEIGHT * user.scale;
                 let content_h    = result_count as f32 * result_h;
                 let viewport_h   = gpu.win_h - (TITLE_BASE_ROW_HEIGHT + PROMPT_BASE_ROW_HEIGHT + SEARCH_BASE_ROW_HEIGHT) * user.scale;
@@ -372,9 +388,7 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
-                let ui   = self.ui.as_mut().unwrap();
-                let gpu  = self.gpu.as_mut().unwrap();
-                let user = self.user.as_mut().unwrap();
+                search.drain();
 
                 let cursor_idle_secs = user.last_keypress.elapsed().as_secs_f32();
 
@@ -382,7 +396,7 @@ impl ApplicationHandler for App {
                 // Build the box tree
                 //
                 ui.begin_frame(gpu.win_w, gpu.win_h);
-                build_ui(ui, user, gpu, cursor_idle_secs);
+                build_ui(ui, user, gpu, search, cursor_idle_secs);
                 ui.end_frame();
 
                 //
@@ -401,6 +415,11 @@ impl ApplicationHandler for App {
                 // Interaction
                 //
                 ui.update_interaction(user.mouse_pos, user.mouse_clicked);
+
+                user.mouse_clicked = false;
+                if user.search_btn_ref.map_or(false, |btn| ui.was_clicked(btn)) {
+                    Self::trigger_search(user, search);
+                }
 
                 //
                 // Tick
