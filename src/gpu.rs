@@ -319,8 +319,10 @@ pub fn pop_clip(gpu: &mut Gpu) {
 
 pub fn draw_rect(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32, color: Color) {
     let (sw, sh) = (gpu.win_w, gpu.win_h);
+
     let [x0, y0] = px(x,   y,   sw, sh);
     let [x1, y1] = px(x+w, y+h, sw, sh);
+
     let color = color.into();
     gpu.verts_mut().extend_from_slice(&[
         Vert { pos:[x0,y0], color, ..Default::default() },
@@ -479,7 +481,10 @@ pub fn submit_frame(gpu: &mut Gpu) -> Result<(), wgpu::SurfaceError> {
             // This is how scroll regions clip their children (BoxFlags::CLIP_CHILDREN).
             //
             for Draw { range, clip } in &draws {
+                //
                 // Clamp to window, wgpu panics if scissor goes out of bounds
+                //
+
                 let cx = clip[0].max(0.0) as u32;
                 let cy = clip[1].max(0.0) as u32;
                 let cw = (clip[2] as u32).min(gpu.win_w as u32 - cx);

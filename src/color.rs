@@ -87,7 +87,13 @@ impl From<[f32; 4]> for GpuColor {
 
 impl From<Color> for GpuColor {
     fn from(Color { r, g, b, a}: Color) -> Self {
-        Self::rgba(r, g, b, a)
+        let a = a as f32 / 255.0;
+        [
+            r as f32 / 255.0 * a,
+            g as f32 / 255.0 * a,
+            b as f32 / 255.0 * a,
+            a,
+        ].into()
     }
 }
 

@@ -1,5 +1,6 @@
 use crate::color::Color;
 use crate::gpu::{FONT_SIZE, Gpu};
+use crate::util::lerp_color;
 
 #[cfg(debug_assertions)]
 use std::cell::RefCell;
@@ -414,6 +415,11 @@ impl UiState {
     }
 
     #[inline]
+    pub fn clear_active(&mut self) {
+        self.active_key = LabelHash(0);
+    }
+
+    #[inline]
     pub fn tick_animations(&mut self) {
         //
         // Collect cursor targets before mutably borrowing persist.
@@ -621,16 +627,6 @@ pub fn render(ui: &UiState, gpu: &mut Gpu) {
     if let Some(root) = ui.root {
         render_box(root, ui, gpu);
     }
-}
-
-#[inline]
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
-}
-
-#[inline]
-fn lerp_color(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
-    [lerp(a[0],b[0],t), lerp(a[1],b[1],t), lerp(a[2],b[2],t), lerp(a[3],b[3],t)]
 }
 
 fn render_box(id: BoxRef, ui: &UiState, gpu: &mut Gpu) {

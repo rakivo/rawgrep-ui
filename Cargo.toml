@@ -7,7 +7,6 @@ edition = "2024"
 winit = { version = "0.30.13", features = ["wayland", "x11"] }
 wgpu = { version = "28.0.0", default-features = false, features = ["vulkan", "wgsl", "std"] }
 pollster = "0.3"
-env_logger = "0.11"
 fontdue = "0.9"
 bytemuck = { version = "1", features = ["derive"] }
 smallstr = { version = "0.3", features = ["union"] }

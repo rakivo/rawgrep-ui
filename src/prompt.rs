@@ -167,8 +167,14 @@ impl PromptState {
     pub fn kill_word_back(&mut self) {
         let old = self.cursor;
         self.move_word_back();
-        for idx in (self.cursor..old).rev() {  // @Speed
-            self.buffer.remove(idx as _);
-        }
+        unsafe { self.buffer.as_mut_vec() }.drain(self.cursor as usize..old as usize);
+    }
+
+    #[inline]
+    pub fn kill_word_forward(&mut self) {
+        let old = self.cursor;
+        self.move_word_forward();
+        unsafe { self.buffer.as_mut_vec() }.drain(old as usize..self.cursor as usize);
+        self.cursor = old;
     }
 }
