@@ -353,8 +353,6 @@ pub fn draw_text_colored(
             continue;
         };
 
-        let color: GpuColor = color_callback(i).into();
-
         if g.w > 0 && g.h > 0 {
             let gx = (x + g.bearing_x as f32).round();
             let gy = (y - g.bearing_y as f32 - g.h as f32).round();
@@ -365,19 +363,14 @@ pub fn draw_text_colored(
             let (u0, v0) = (g.uv_x,            g.uv_y);
             let (u1, v1) = (g.uv_x + g.uv_w,   g.uv_y + g.uv_h);
 
-            //
-            // Premultiplied alpha - multiply rgb by alpha before storing
-            //
-            let a = color[3] as f32;
-            let color = GpuColor([color[0]*a, color[1]*a, color[2]*a, a]);
-
+            let color: GpuColor = color_callback(i).into();
             gpu.verts_mut().extend_from_slice(&[
-                Vert { pos:[x0,y0], uv:[u0,v0], color },
-                Vert { pos:[x1,y0], uv:[u1,v0], color },
-                Vert { pos:[x0,y1], uv:[u0,v1], color },
-                Vert { pos:[x1,y0], uv:[u1,v0], color },
-                Vert { pos:[x1,y1], uv:[u1,v1], color },
-                Vert { pos:[x0,y1], uv:[u0,v1], color },
+                Vert { pos:[x0, y0], uv:[u0, v0], color },
+                Vert { pos:[x1, y0], uv:[u1, v0], color },
+                Vert { pos:[x0, y1], uv:[u0, v1], color },
+                Vert { pos:[x1, y0], uv:[u1, v0], color },
+                Vert { pos:[x1, y1], uv:[u1, v1], color },
+                Vert { pos:[x0, y1], uv:[u0, v1], color },
             ]);
         }
 

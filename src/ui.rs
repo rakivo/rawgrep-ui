@@ -1,6 +1,7 @@
 use crate::color::Color;
-use crate::gpu::{FONT_SIZE, Gpu};
+use crate::highlight::TokenKind;
 use crate::util::lerp_color;
+use crate::gpu::{self, FONT_SIZE, Gpu};
 
 #[cfg(debug_assertions)]
 use std::cell::RefCell;
@@ -41,11 +42,18 @@ pub struct TextInputInfo {
     pub cursor_char: Option<char>,
 }
 
+/// Text but with syntax and match highlighting.
+pub struct MatchInfo {
+    pub match_ranges: Boxed<[(u32, u32)]>,
+    pub byte_kinds:   Boxed<[TokenKind]>,  // Indexed by byte
+}
+
 #[derive(Default)]
 pub enum BoxCustom {
     #[default]
     None,
 
+    Match(MatchInfo),
     TextInput(TextInputInfo),
 }
 
@@ -576,8 +584,8 @@ impl UiState {
         let flags = self.boxes[id].flags;
 
         let rect = [
-            origin[0],           origin[1],
-            origin[0] + size[0], origin[1] + size[1],
+            origin[0].round(),             origin[1].round(),
+            (origin[0] + size[0]).round(), (origin[1] + size[1]).round(),
         ];
         self.boxes[id].rect      = rect;
         self.boxes[id].clip_rect = clip;
@@ -597,14 +605,14 @@ impl UiState {
             clip
         };
 
-        let mut cursor = origin[axis] - scroll_off;
+        let mut cursor = (origin[axis] - scroll_off).round();
         for c in children {
             let child_size = self.boxes[c].computed_size;
             let mut child_origin = origin;
             child_origin[axis]  = cursor;
-            child_origin[cross] = origin[cross];
+            child_origin[cross] = origin[cross].round();
             self.pass3_place(c, child_origin, child_clip);
-            cursor += child_size[axis];
+            cursor = (cursor + child_size[axis]).round();
         }
     }
 
@@ -653,7 +661,7 @@ fn render_box(id: BoxRef, ui: &UiState, gpu: &mut Gpu) {
             (color[3])
         ].into();
 
-        crate::gpu::draw_rect(gpu, x, y, w, h, flashed_color);
+        gpu::draw_rect(gpu, x, y, w, h, flashed_color);
     }
 
     //
@@ -661,9 +669,9 @@ fn render_box(id: BoxRef, ui: &UiState, gpu: &mut Gpu) {
     //
     if b.flags.contains(BoxFlags::DRAW_BORDER) {
         // Bottom border
-        crate::gpu::draw_rect(gpu, x, y + h - 1.0, w, 1.0, b.border_color);
+        gpu::draw_rect(gpu, x, y + h - 1.0, w, 1.0, b.border_color);
         // Left border
-        crate::gpu::draw_rect(gpu, x, y, 1.0, h, b.border_color);
+        gpu::draw_rect(gpu, x, y, 1.0, h, b.border_color);
     }
 
     if b.flags.contains(BoxFlags::DRAW_TEXT) {
@@ -675,8 +683,13 @@ fn render_box(id: BoxRef, ui: &UiState, gpu: &mut Gpu) {
             .map(|i| &b.text[..i])
             .unwrap_or(&b.text);
 
-        if !display_text.is_empty() {
-            crate::gpu::draw_text(gpu, display_text, text_x, text_y, b.font_size, b.text_color);
+        if !matches!(&b.custom, BoxCustom::Match(_)) {
+            //
+            // BoxCustom::Match draws the text by itself
+            //
+            if !display_text.is_empty() {
+                gpu::draw_text(gpu, display_text, text_x, text_y, b.font_size, b.text_color);
+            }
         }
 
         if let BoxCustom::TextInput(TextInputInfo {
@@ -684,18 +697,18 @@ fn render_box(id: BoxRef, ui: &UiState, gpu: &mut Gpu) {
             cursor_idle_secs,
             cursor_char,
             ..
-        }) = b.custom {
+        }) = &b.custom {
             // Use smoothed position from persist, fall back to raw offset
             let smooth_x = persist
                 .map(|p| p.cursor_visual_x)
-                .unwrap_or(cursor_pixel_offset);
+                .unwrap_or(*cursor_pixel_offset);
 
             let cursor_w = b.font_size * 0.57; // roughly one char width
             let cursor_h = b.font_size;
             let cursor_x = x + pad + smooth_x;
             let cursor_y = y + (h - cursor_h) * 0.5;
 
-            let alpha = if cursor_idle_secs < 0.5 {
+            let alpha = if *cursor_idle_secs < 0.5 {
                 1.0
             } else if ((cursor_idle_secs - 0.5) % 1.0) < 0.5 {
                 1.0
@@ -704,7 +717,7 @@ fn render_box(id: BoxRef, ui: &UiState, gpu: &mut Gpu) {
             };
 
             if alpha > 0.0 {
-                crate::gpu::draw_rect(
+                gpu::draw_rect(
                     gpu,
                     cursor_x,
                     cursor_y,
@@ -714,7 +727,7 @@ fn render_box(id: BoxRef, ui: &UiState, gpu: &mut Gpu) {
                 );
 
                 if let Some(ch) = cursor_char {
-                    crate::gpu::draw_text(
+                    gpu::draw_text(
                         gpu,
                         &ch.to_string(),
                         cursor_x,
@@ -725,10 +738,34 @@ fn render_box(id: BoxRef, ui: &UiState, gpu: &mut Gpu) {
                 }
             }
         }
+
+        if let BoxCustom::Match(info) = &b.custom {
+            let char_starts = b.text.char_indices().map(|(b, _)| b as u32).collect::<Vec<_>>();
+            gpu::draw_text_colored(
+                gpu, display_text, text_x, text_y, b.font_size,
+                |char_idx| {  // @Constant
+                    let byte = char_starts.get(char_idx).copied().unwrap_or(0);
+                    if info.match_ranges.iter().any(|(s, e)| byte >= *s && byte < *e) {
+                        return Color::rgba(255, 85, 85, 255);
+                    }
+
+                    match info.byte_kinds.get(byte as usize).copied().unwrap_or(TokenKind::Normal) {
+                        TokenKind::Keyword  => Color::rgba(100, 150, 190, 255),
+                        TokenKind::String   => Color::rgba(90,  160, 80,  255),
+                        TokenKind::Comment  => Color::rgba(70,  78,  88,  255),
+                        TokenKind::Number   => Color::rgba(180, 140, 90,  255),
+                        TokenKind::Note     => Color::rgba(220, 180, 80,  255),
+                        TokenKind::Type     => Color::rgba(100, 180, 130, 255),
+                        TokenKind::Macro    => Color::rgba(160, 120, 180, 255),
+                        TokenKind::Normal   => Color::rgba(160, 160, 165, 255),
+                    }
+                }
+            );
+        }
     }
 
     if b.flags.contains(BoxFlags::CLIP_CHILDREN) {
-        crate::gpu::push_clip(gpu, x, y, w, h);
+        gpu::push_clip(gpu, x, y, w, h);
     }
 
     for &child in &b.children {
@@ -736,7 +773,7 @@ fn render_box(id: BoxRef, ui: &UiState, gpu: &mut Gpu) {
     }
 
     if b.flags.contains(BoxFlags::CLIP_CHILDREN) {
-        crate::gpu::pop_clip(gpu);
+        gpu::pop_clip(gpu);
     }
 }
 

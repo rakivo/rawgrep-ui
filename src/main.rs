@@ -4,15 +4,17 @@ mod util;
 mod color;
 mod prompt;
 mod search;
+mod highlight;
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use gpu::Gpu;
 use color::Color;
+use highlight::TokenKind;
 use prompt::PromptState;
 use search::{SearchManager, SearchStatus};
-use ui::{Axis, BoxCustom, BoxRef, Size, TextInputInfo, UiState};
+use ui::{Axis, BoxCustom, BoxRef, MatchInfo, Size, TextInputInfo, UiState};
 
 use util::{display_path, lerp_color};
 use winit::window::{Window, WindowId};
@@ -23,10 +25,9 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 
 const MIN_SCALE: f32 = 0.75;
 const MAX_SCALE: f32 = 5.00;
+const BASE_SCALE: f32 = 1.45;
 
 const PROMPT_PREFIX: &str = "> ";
-
-const BASE_SCALE: f32 = 1.45;
 
 const SCROLL_BAR_HOVER_EXPANSION_FACTOR: f32 = 3.5;
 
@@ -386,8 +387,13 @@ fn build_ui(
         for (index, m) in results.get(visible_start..visible_end).unwrap_or_default().iter().enumerate() {
             let index = index + visible_start;
 
-            let Ok(text)     = std::str::from_utf8(&m.text) else { continue };
-            let text = text.trim_start();
+            let Ok(text_raw)     = std::str::from_utf8(&m.text) else { continue };
+            let text = text_raw.trim_start();
+            let trim_offset = (text_raw.len() - text.len()) as u32;
+            let ranges = m.ranges.iter().filter_map(|(s, e)| {    // adjust ranges
+                if *e <= trim_offset { None }       // range entirely in trimmed part
+                else { Some((s.saturating_sub(trim_offset), *e - trim_offset)) }
+            }).collect();
 
             let Ok(filename) = std::str::from_utf8(&m.path) else { continue };
             let filename     = display_path(&filename, 16); // @Constant @Tune
@@ -414,12 +420,24 @@ fn build_ui(
                         .color(palette.dim)
                         .build();
 
-                    ui.label(&format!("result_{index}##text"))
+                    let text_ref = ui.label(&format!("result_{index}##text"))
                         .size(Size::fill(), Size::fill())
                         .font_size(result_font_size)
                         .padding(6.0 * scale)
                         .text(text)
                         .build();
+
+                    let mut byte_kinds = vec![TokenKind::Normal; text.len() + 1];  // @Memory
+                    for t in highlight::tokenize(text) {
+                        for k in &mut byte_kinds[t.start as usize..t.end as usize] {
+                            *k = t.kind;
+                        }
+                    }
+
+                    ui.boxes[text_ref].custom = BoxCustom::Match(MatchInfo {
+                        match_ranges: ranges,
+                        byte_kinds: byte_kinds.into()
+                    });
                 });
 
             user.frame_search_results.push(result_ref);
@@ -565,7 +583,7 @@ impl ApplicationHandler for App {
                     // Clear the error on keypress!
                     //
                     search.status = SearchStatus::Idle;
-                    *search.pending_status.lock() = SearchStatus::Idle;
+                    search.pending.lock().status = SearchStatus::Idle;
                 }
             }
 
