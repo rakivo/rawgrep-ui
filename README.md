@@ -125,7 +125,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Font
 
-Uses [Liberation Mono](https://github.com/liberationfonts/liberation-fonts) — see `fonts/OFL.txt` for license.
+Uses [Liberation Mono](https://github.com/liberationfonts/liberation-fonts) - see `fonts/OFL.txt` for license.
 
 ## License
 
