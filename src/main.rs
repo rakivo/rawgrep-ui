@@ -380,18 +380,20 @@ fn build_ui(
         let digits_count   = max_line_num.ilog10() + 1;
         let digit_w = gpu::get_glyph(gpu, '0', result_font_size).map(|g| g.advance)
             .unwrap_or(result_font_size * 0.6);
-        let linenum_w = (digits_count as f32 + 4.5) * digit_w ;
+        let linenum_w = (digits_count as f32 + 4.5) * digit_w;
 
         user.frame_search_results.clear();
 
         for (index, m) in results.get(visible_start..visible_end).unwrap_or_default().iter().enumerate() {
             let index = index + visible_start;
 
-            let Ok(text_raw)     = std::str::from_utf8(&m.text) else { continue };
+            let Ok(text_raw) = std::str::from_utf8(&m.text) else { continue };
             let text = text_raw.trim_start();
             let trim_offset = (text_raw.len() - text.len()) as u32;
-            let ranges = m.ranges.iter().filter_map(|(s, e)| {    // adjust ranges
-                if *e <= trim_offset { None }       // range entirely in trimmed part
+
+            // Adjust ranges because we trimmed the start..
+            let ranges = m.ranges.iter().filter_map(|(s, e)| {
+                if *e <= trim_offset { None }  // Range entirely in trimmed part
                 else { Some((s.saturating_sub(trim_offset), *e - trim_offset)) }
             }).collect();
 
@@ -401,7 +403,7 @@ fn build_ui(
 
             let result_ref = ui.row(&format!("result_{index}"))
                 .size(Size::fill(), Size::px(result_h))
-                .bg(if index % 2 == 0 { Color::rgba(15,15,15,255) } else { Color::rgba(18,18,18,255) })
+                .bg(if index % 2 == 0 { Color::rgba(15, 15, 15, 255) } else { Color::rgba(18, 18, 18, 255) })
                 .hover_color(Color::rgba(30, 35, 45, 255))
                 .build_children(|ui| {
                     ui.label(&format!("result_{index}##filename"))
