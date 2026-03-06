@@ -295,24 +295,44 @@ pub fn get_glyph(gpu: &mut Gpu, c: char, size: f32) -> Option<Glyph> {
 }
 
 #[inline]
+pub fn reset_atlas(gpu: &mut Gpu) {
+    gpu.glyphs.clear();
+    gpu.atlas_cur_x = 1;
+    gpu.atlas_cur_y = 1;
+    gpu.atlas_row_h = 0;
+}
+
+#[inline]
 pub fn push_clip(gpu: &mut Gpu, x: f32, y: f32, w: f32, h: f32) {
-    gpu.clip_stack.push([x, y, w, h]);
-    gpu.current_clip = [x, y, w, h];
-    gpu.batches.push(Batch::new([x, y, w, h]));
+    let i = gpu.batch_count;
+    if i >= gpu.batch_pool.len() {
+        gpu.batch_pool.push(Batch::new([x, y, w, h]));
+    } else {
+        gpu.batch_pool[i].clip = [x, y, w, h];
+        gpu.batch_pool[i].verts.clear();
+    }
+
+    gpu.batch_count += 1;
 }
 
 #[inline]
 pub fn pop_clip(gpu: &mut Gpu) {
-    gpu.clip_stack.pop();
+    let clip = if gpu.batch_count >= 2 {
+        gpu.batch_pool[gpu.batch_count - 2].clip
+    } else {
+        [0.0, 0.0, gpu.win_w, gpu.win_h]
+    };
 
-    let clip = gpu.clip_stack.last()
-        .copied()
-        .unwrap_or([0.0, 0.0, gpu.win_w, gpu.win_h]);
+    let i = gpu.batch_count;
+    if i >= gpu.batch_pool.len() {
+        gpu.batch_pool.push(Batch::new(clip));
+    } else {
+        gpu.batch_pool[i].clip = clip;
+        gpu.batch_pool[i].verts.clear();
+    }
 
-    gpu.current_clip = clip;
-    gpu.batches.push(Batch::new(clip));
+    gpu.batch_count += 1;
 }
-
 //
 // Draw primitives
 //

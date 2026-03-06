@@ -9,7 +9,7 @@ mod highlight;
 use std::sync::Arc;
 use std::time::Instant;
 
-use gpu::Gpu;
+use gpu::{Gpu, reset_atlas};
 use color::Color;
 use highlight::TokenKind;
 use prompt::PromptState;
@@ -26,6 +26,9 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 const MIN_SCALE: f32 = 0.75;
 const MAX_SCALE: f32 = 5.00;
 const BASE_SCALE: f32 = 1.45;
+const SCALE_ON_STEP: f32 = 0.25;
+
+const DEBOUNCE_MS: u64 = 10;
 
 const PROMPT_PREFIX: &str = "> ";
 
@@ -87,6 +90,7 @@ struct UserState {
     mouse_clicked: bool,
 
     last_keypress: Instant,
+    last_typed: Option<Instant>,
 
     search_btn_ref: Option<BoxRef>,
     prompt_input_ref: Option<BoxRef>,
@@ -104,9 +108,9 @@ impl UserState {
         let now = Instant::now();
         Self {
             scale: BASE_SCALE,
-            mouse_pos:      [0.0; 2],
-            last_keypress:  now,
+            last_keypress: now,
 
+            mouse_pos:            Default::default(),
             mouse_clicked:        Default::default(),
             prompt:               Default::default(),
             prompt_input_ref:     Default::default(),
@@ -114,6 +118,7 @@ impl UserState {
             scrollbar_drag:       Default::default(),
             search_btn_ref:       Default::default(),
             scrollbar_hot_t:      Default::default(),
+            last_typed:           Default::default(),
         }
     }
 }
@@ -156,41 +161,6 @@ impl ScrollbarGeometry {
             thumb_y, thumb_h,
             max_scroll
         })
-    }
-}
-
-#[inline]
-fn draw_error(
-    ui: &UiState,
-    user: &UserState,
-    gpu: &mut Gpu,
-    search: &SearchManager
-) {
-    let SearchStatus::Error(msg) = &search.status else {
-        return;
-    };
-
-    if let Some(input) = user.prompt_input_ref {
-        let b = &ui.boxes[input];
-        let [x0, y0, _, y1] = b.rect;
-
-        let w = gpu.win_w - x0; // Stretch to window edge
-        let h = y1 - y0;
-
-        let text_x = x0 + 4.0 * user.scale;
-        let text_y = y0 + h * 0.5 + PROMPT_BASE_FONT_SIZE * user.scale * 0.35;
-
-        //
-        // Dim overlay user you can still see the input text underneath
-        //
-        gpu::draw_rect(gpu, x0, y0, w, h, Color::rgba(40, 10, 10, 210));
-        gpu::draw_text(
-            gpu,
-            msg,
-            text_x, text_y,
-            PROMPT_BASE_FONT_SIZE * user.scale * 0.85,
-            Color::rgba(180, 80, 80, 255)
-        );
     }
 }
 
@@ -353,6 +323,17 @@ fn build_ui(
                 .font_size(search_font_size)
                 .build()
                 .into();
+
+            if let SearchStatus::Error(msg) = &search.status {
+                ui.label("search##error")
+                    .size(Size::fill(), Size::fill())
+                    .padding(scale * 8.0)
+                    .text(msg.as_ref())
+                    .font_size(search_font_size * 0.85)
+                    .bg(Color::rgba(40, 10, 10, 210))
+                    .color(Color::rgba(180, 80, 80, 255))
+                    .build();
+            }
         });
 
     let results = &search.results;
@@ -526,7 +507,6 @@ impl ApplicationHandler for App {
                 let alt = self.mods.state().alt_key();
 
                 let old_prompt_len = user.prompt.buffer().len();
-                let old_cursor_pos = user.prompt.cursor();
 
                 let mut stop_drawing_error = false;
 
@@ -536,14 +516,15 @@ impl ApplicationHandler for App {
                     PhysicalKey::Code(KeyCode::Enter) => {
                         Self::trigger_search(user, search);
                         stop_drawing_error = true;
+                        user.last_typed = None;
                     }
 
                     PhysicalKey::Code(KeyCode::Space)      => user.prompt.push_char(' '),
 
                     PhysicalKey::Code(KeyCode::Backspace)  => if ctrl {
-                        user.prompt.kill_word_back()                                                  // C-w
+                        user.prompt.kill_word_back();
                     } else {
-                        _ = user.prompt.pop_char()
+                        user.prompt.pop_char();
                     }
 
                     PhysicalKey::Code(KeyCode::ArrowLeft)  => user.prompt.move_cursor_left(),
@@ -556,6 +537,25 @@ impl ApplicationHandler for App {
 
                         if ctrl {
                             match event.physical_key {
+                                PhysicalKey::Code(KeyCode::Equal | KeyCode::Minus) => {
+                                    let new = if matches!(event.physical_key, PhysicalKey::Code(KeyCode::Equal)) {
+                                        user.scale + SCALE_ON_STEP
+                                    } else {
+                                        user.scale - SCALE_ON_STEP
+                                    }.clamp(MIN_SCALE, MAX_SCALE);
+
+                                    if new != user.scale {
+                                        user.scale = new;
+
+                                        reset_atlas(gpu);
+                                        ui.clamp_scroll(
+                                            "results",
+                                            results_content_h(search.results.len(), user.scale),
+                                            results_viewport_h(gpu, user.scale)
+                                        );
+                                    }
+                                }
+
                                 PhysicalKey::Code(KeyCode::KeyB) => user.prompt.move_cursor_left(),   // C-b
                                 PhysicalKey::Code(KeyCode::KeyF) => user.prompt.move_cursor_right(),  // C-f
                                 PhysicalKey::Code(KeyCode::KeyA) => user.prompt.move_cursor_start(),  // C-a
@@ -577,15 +577,24 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                stop_drawing_error |= user.prompt.buffer().len() != old_prompt_len;
-                stop_drawing_error |= user.prompt.cursor() != old_cursor_pos;
+                let prompt_updated = old_prompt_len != user.prompt.buffer().len();
 
+                let reset_debounce = prompt_updated;
+                if reset_debounce {
+                    user.last_typed = Some(Instant::now());
+                }
+
+                stop_drawing_error |= prompt_updated;
                 if stop_drawing_error && matches!(search.status, SearchStatus::Error(_)) {
                     //
                     // Clear the error on keypress!
                     //
                     search.status = SearchStatus::Idle;
                     search.pending.lock().status = SearchStatus::Idle;
+                }
+
+                if user.prompt.buffer().len() == 0 {
+                    search.results.clear();
                 }
             }
 
@@ -602,11 +611,7 @@ impl ApplicationHandler for App {
                     user.scale = (user.scale + dy * 0.1).clamp(MIN_SCALE, MAX_SCALE);
                     ui.clamp_scroll("results", content_h, viewport_h);
 
-                    // @Speed: We recompute glyphs on each scale change from scratch...
-                    gpu.glyphs.clear();
-                    gpu.atlas_cur_x = 1;
-                    gpu.atlas_cur_y = 1;
-                    gpu.atlas_row_h = 0;
+                    reset_atlas(gpu);
 
                     return;
                 }
@@ -671,6 +676,13 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
+                if let Some(last_typed) = user.last_typed {
+                    if last_typed.elapsed().as_millis() as u64 >= DEBOUNCE_MS {
+                        user.last_typed = None;
+                        App::trigger_search(user, search);
+                    }
+                }
+
                 //
                 // Drain potential search results to our local storage
                 //
@@ -724,7 +736,6 @@ impl ApplicationHandler for App {
                 if let Some(ref geom) = scrollbar {
                     draw_scrollbar(gpu, geom, user.scrollbar_hot_t);
                 }
-                draw_error(ui, user, gpu, search);
 
                 //
                 // Submit
