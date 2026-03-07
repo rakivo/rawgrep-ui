@@ -740,6 +740,7 @@ fn render_box(id: BoxRef, ui: &UiState, gpu: &mut Gpu) {
         }
 
         if let BoxCustom::Match(info) = &b.custom {
+            // @Memory
             let char_starts = b.text.char_indices().map(|(b, _)| b as u32).collect::<Vec<_>>();
             gpu::draw_text_colored(
                 gpu, display_text, text_x, text_y, b.font_size,

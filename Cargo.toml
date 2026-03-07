@@ -13,11 +13,16 @@ smallstr = { version = "0.3", features = ["union"] }
 cranelift-entity = "0.129.1"
 bitflags = "2.11.0"
 smallvec = "1.15.1"
-rawgrep = { path = "../rawgrep" }
 parking_lot = "0.12.5"
+dhat = { version = "0.3.3", optional = true }
+rawgrep = { git = "https://github.com/rakivo/rawgrep.git", rev = "6b9aee8" }
 
 [features]
+dhat = ["dep:dhat"]
 use_nightly = ["rawgrep/use_nightly"]
+
+[profile.release]
+debug = 1
 
 [profile.release-fast]
 inherits = "release"

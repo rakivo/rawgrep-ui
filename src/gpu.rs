@@ -1,6 +1,6 @@
 use crate::color::{GpuColor, Color};
 use crate::palette;
-use crate::util::{px, size_key};
+use crate::util::px;
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -9,7 +9,10 @@ use std::collections::HashMap;
 use winit::window::Window;
 
 pub const FONT_SIZE: f32 = 14.0;
-const ATLAS_SIZE:  u32 = 512;
+
+const ATLAS_SIZE: u32 = 1024; // 1MB
+const ATLAS_RESET_RATIO: f32 = 0.8; // 80%
+
 const VTX_BUF_CAP: u64 = 64 * 1024;
 
 #[derive(Default, Clone, Copy)]
@@ -66,22 +69,19 @@ pub struct Gpu {
     pub font:           fontdue::Font,
 
     pub vtx_buf_cap:    u64,
-
-    pub batches:      Vec<Batch>,
-    pub current_clip: [f32; 4],
-    pub clip_stack:   Vec<[f32; 4]>,
+    pub batch_pool:     Vec<Batch>,
+    pub batch_count:    usize,
 }
 
 impl Gpu {
     #[inline]
-    #[allow(unused)]
-    pub fn verts(&self) -> &Vec<Vert> {
-        &self.batches.last().unwrap().verts
+    pub fn verts_mut(&mut self) -> &mut Vec<Vert> {
+        &mut self.batch_pool[self.batch_count - 1].verts
     }
 
     #[inline]
-    pub fn verts_mut(&mut self) -> &mut Vec<Vert> {
-        &mut self.batches.last_mut().unwrap().verts
+    pub fn current_clip(&self) -> [f32; 4] {
+        self.batch_pool[self.batch_count - 1].clip
     }
 }
 
@@ -226,12 +226,11 @@ async fn init_async(window: Arc<Window>) -> Gpu {
 
         atlas_tex, atlas_cur_x: 1, atlas_cur_y: 1, atlas_row_h: 0,
 
-        glyphs: HashMap::new(),
+        glyphs: Default::default(),
         vtx_buf_cap: VTX_BUF_CAP,
 
-        clip_stack:   Vec::new(),
-        batches:      vec![Batch::full_window(w as _, h as _)],
-        current_clip: [0.0, 0.0, w as f32, h as f32],
+        batch_pool:  vec![Batch::full_window(w as _, h as _)],
+        batch_count: 1
     }
 }
 
@@ -240,28 +239,37 @@ async fn init_async(window: Arc<Window>) -> Gpu {
 //
 
 pub fn get_glyph(gpu: &mut Gpu, c: char, size: f32) -> Option<Glyph> {
-    let key = (c, size_key(size));
+    let size = (size * 2.0).round() / 2.0; // snap to 0.5px increments
+    let key = (c, (size * 2.0) as u32);
     if let Some(g) = gpu.glyphs.get(&key) {
         return Some(*g);
     }
 
     let (metrics, bitmap) = gpu.font.rasterize(c, size);
-
     if metrics.width == 0 || metrics.height == 0 {
+        // Cache the miss so we don't re-rasterize
         let g = Glyph { advance: metrics.advance_width, ..Default::default() };
         gpu.glyphs.insert(key, g);
         return Some(g);
     }
 
     let (w, h) = (metrics.width as u32, metrics.height as u32);
+
+    let atlas_used = gpu.atlas_cur_y * ATLAS_SIZE + gpu.atlas_cur_x;
+    let atlas_total = ATLAS_SIZE * ATLAS_SIZE;
+    if (atlas_used as f32 / atlas_total as f32) > ATLAS_RESET_RATIO {
+        reset_atlas(gpu);
+    }
+
     if gpu.atlas_cur_x + w + 1 > ATLAS_SIZE {
+        // Row wrap
         gpu.atlas_cur_y += gpu.atlas_row_h + 1;
-        gpu.atlas_cur_x  = 1;
-        gpu.atlas_row_h  = 0;
+        gpu.atlas_cur_x = 1;
+        gpu.atlas_row_h = 0;
     }
     if gpu.atlas_cur_y + h + 1 > ATLAS_SIZE {
         eprintln!("atlas full");
-        return None;
+        return None; // Shouldn't really happen though!
     }
 
     gpu.queue.write_texture(
@@ -365,10 +373,8 @@ pub fn draw_text_colored(
 ) {
     let (sw, sh) = (gpu.win_w, gpu.win_h);
 
-    let glyphs = text.chars().map(|c| get_glyph(gpu, c, font_size)).collect::<Vec<_>>();
-
-    for (i, g_opt) in glyphs.into_iter().enumerate() {
-        let Some(g) = g_opt else {
+    for (i, c) in text.chars().enumerate() {
+        let Some(g) = get_glyph(gpu, c, font_size) else {
             x += 8.0;
             continue;
         };
@@ -405,51 +411,23 @@ pub fn draw_text(gpu: &mut Gpu, text: &str, x: f32, y: f32, font_size: f32, colo
 }
 
 pub fn submit_frame(gpu: &mut Gpu) -> Result<(), wgpu::SurfaceError> {
-    //
-    // Collect all verts from all batches into one flat buffer.
-    // Track where each batch starts and ends so we can draw them separately.
-    //
-
     struct Draw {
         range: Range<u32>,
-        clip: [f32; 4]
+        clip: [f32; 4],
     }
 
-    let mut all_verts = Vec::new();
+    //
+    // Build draw list and upload verts directly from each batch to the GPU buffer
+    //
+
+    let total_verts = gpu.batch_pool.iter().map(|b| b.verts.len()).sum::<usize>();
+    let byte_size = (total_verts * size_of::<Vert>()) as u64;
+
     let mut draws = Vec::new();
 
-    for batch in &gpu.batches {
-        if batch.verts.is_empty() { continue }
-
-        let start = all_verts.len() as u32;
-        all_verts.extend_from_slice(&batch.verts);
-        let end = all_verts.len() as u32;
-
-        draws.push(Draw {
-            range: start..end,
-            clip: batch.clip
-        });
-    }
-
-    //
-    // Reset batch state for next frame.
-    // Always start with one batch covering the full window.
-    //
-
-    let full_window = [0.0, 0.0, gpu.win_w, gpu.win_h];
-    gpu.batches.clear();
-    gpu.batches.push(Batch::full_window(gpu.win_w, gpu.win_h));
-    gpu.current_clip = full_window;
-    gpu.clip_stack.clear();
-
-    //
-    // Upload verts to GPU buffer.
-    // Grow the buffer if needed, we never shrink it.
-    //
-
-    let byte_size = (all_verts.len() * size_of::<Vert>()) as u64;
     if byte_size > 0 {
         if byte_size > gpu.vtx_buf_cap {
+            // Grow if needed
             let new_cap = (byte_size * 2).max(VTX_BUF_CAP);
             gpu.vtx_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
                 label: None, size: new_cap,
@@ -459,13 +437,32 @@ pub fn submit_frame(gpu: &mut Gpu) -> Result<(), wgpu::SurfaceError> {
             gpu.vtx_buf_cap = new_cap;
         }
 
-        gpu.queue.write_buffer(&gpu.vtx_buf, 0, bytemuck::cast_slice(&all_verts));
+        let mut vert_offset = 0u32;
+        for batch in &gpu.batch_pool[..gpu.batch_count] {
+            if batch.verts.is_empty() { continue }
+
+            let byte_offset = (vert_offset as usize * size_of::<Vert>()) as u64;
+            gpu.queue.write_buffer(&gpu.vtx_buf, byte_offset, bytemuck::cast_slice(&batch.verts));
+
+            let end = vert_offset + batch.verts.len() as u32;
+            draws.push(Draw { range: vert_offset..end, clip: batch.clip });
+
+            vert_offset = end;
+        }
     }
 
     //
-    // Begin the frame, get the surface texture and clear it to the background color.
+    // Reset batch state for next frame
     //
+    for batch in &mut gpu.batch_pool[..gpu.batch_count] {
+        batch.verts.clear();
+    }
+    gpu.batch_count = 1;
+    gpu.batch_pool[0].clip = [0.0, 0.0, gpu.win_w, gpu.win_h];
 
+    //
+    // Begin the frame
+    //
     let output = gpu.surface.get_current_texture()?;
     let view   = output.texture.create_view(&Default::default());
     let mut enc = gpu.device.create_command_encoder(&Default::default());
@@ -488,16 +485,7 @@ pub fn submit_frame(gpu: &mut Gpu) -> Result<(), wgpu::SurfaceError> {
             pass.set_bind_group(0, &gpu.bind_group, &[]);
             pass.set_vertex_buffer(0, gpu.vtx_buf.slice(..));
 
-            //
-            // Draw each batch with its own scissor rect.
-            // The scissor tells the GPU: only write pixels inside this rectangle.
-            // This is how scroll regions clip their children (BoxFlags::CLIP_CHILDREN).
-            //
             for Draw { range, clip } in &draws {
-                //
-                // Clamp to window, wgpu panics if scissor goes out of bounds
-                //
-
                 let cx = clip[0].max(0.0) as u32;
                 let cy = clip[1].max(0.0) as u32;
                 let cw = (clip[2] as u32).min(gpu.win_w as u32 - cx);

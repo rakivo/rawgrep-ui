@@ -1,3 +1,7 @@
+#[cfg(feature = "dhat")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 mod ui;
 mod gpu;
 mod util;
@@ -230,7 +234,8 @@ fn interact(
         let visible_start = (scroll_off / result_h).floor() as usize;
 
         let index = visible_start + index;
-        let result = &search.results[index];
+        let results = search.matches();
+        let result = results.get(index).unwrap();
         if let Ok(path) = std::str::from_utf8(&result.path) {
             crate::util::open_in_emacs(path, result.line_num);
         }
@@ -336,17 +341,17 @@ fn build_ui(
             }
         });
 
-    let results = &search.results;
+    let results_len = search.match_count();
 
     let viewport_h = results_viewport_h(gpu, scale);
 
     let scroll_off    = ui.get_scroll("results");
     let visible_start = (scroll_off / result_h).floor() as usize;
     let visible_count = (viewport_h / result_h).ceil() as usize + 2; // +2 for the partially visible bottom and the top rows
-    let visible_end   = (visible_start + visible_count).min(results.len());
+    let visible_end   = (visible_start + visible_count).min(results_len);
 
     let top_space    = visible_start as f32 * result_h;
-    let bottom_space = (results.len().saturating_sub(visible_end)) as f32 * result_h;
+    let bottom_space = (results_len.saturating_sub(visible_end)) as f32 * result_h;
 
     ui.scroll("results")
     .size(Size::fill(), Size::fill())
@@ -357,15 +362,21 @@ fn build_ui(
             ui.spacer("results##top", Axis::Y, top_space);
         }
 
-        let max_line_num = search.results.iter().map(|m| m.line_num).max().unwrap_or(1);
-        let digits_count   = max_line_num.ilog10() + 1;
+        let matches = search.try_matches();
+
+        let max_line_num = matches.iter().map(|m| m.line_num).max().unwrap_or(1);
+        let digits_count = max_line_num.ilog10() + 1;
         let digit_w = gpu::get_glyph(gpu, '0', result_font_size).map(|g| g.advance)
             .unwrap_or(result_font_size * 0.6);
+
+        // @UX: Smooth this out somehow, so when we find new matches this won't wiggle as much.
         let linenum_w = (digits_count as f32 + 4.5) * digit_w;
 
         user.frame_search_results.clear();
 
-        for (index, m) in results.get(visible_start..visible_end).unwrap_or_default().iter().enumerate() {
+        let visible = matches.iter().enumerate().skip(visible_start).take(visible_end - visible_start);
+
+        for (index, m) in visible {
             let index = index + visible_start;
 
             let Ok(text_raw) = std::str::from_utf8(&m.text) else { continue };
@@ -550,7 +561,7 @@ impl ApplicationHandler for App {
                                         reset_atlas(gpu);
                                         ui.clamp_scroll(
                                             "results",
-                                            results_content_h(search.results.len(), user.scale),
+                                            results_content_h(search.match_count(), user.scale),
                                             results_viewport_h(gpu, user.scale)
                                         );
                                     }
@@ -589,17 +600,16 @@ impl ApplicationHandler for App {
                     //
                     // Clear the error on keypress!
                     //
-                    search.status = SearchStatus::Idle;
-                    search.pending.lock().status = SearchStatus::Idle;
+                    search.set_idle();
                 }
 
                 if user.prompt.buffer().len() == 0 {
-                    search.results.clear();
+                    search.clear();
                 }
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                let content_h  = results_content_h(search.results.len(), user.scale);
+                let content_h  = results_content_h(search.match_count(), user.scale);
                 let viewport_h = results_viewport_h(gpu, user.scale);
 
                 if self.mods.state().control_key() {
@@ -659,7 +669,7 @@ impl ApplicationHandler for App {
                 let Some(scrollbar) = ScrollbarGeometry::compute(
                     gpu,
                     ui,
-                    search.results.len(),
+                    search.match_count(),
                     user.scale
                 ) else {
                     return;
@@ -713,7 +723,7 @@ impl ApplicationHandler for App {
                 // Interaction
                 //
                 ui.update_interaction(user.mouse_pos, user.mouse_clicked);
-                let scrollbar = ScrollbarGeometry::compute(gpu, ui, search.results.len(), user.scale);
+                let scrollbar = ScrollbarGeometry::compute(gpu, ui, search.match_count(), user.scale);
                 {
                     interact(ui, user, gpu, search, scrollbar.as_ref());
                     user.mouse_clicked = false;
@@ -751,6 +761,9 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
+    #[cfg(feature = "dhat")]
+    let _profiler = dhat::Profiler::new_heap();
+
     rawgrep::util::init_logging();
 
     let el = EventLoop::new().unwrap();

@@ -7,11 +7,6 @@ pub fn px(x: f32, y: f32, sw: f32, sh: f32) -> [f32; 2] {
 }
 
 #[inline]
-pub fn size_key(px: f32) -> u32 {
-    (px * 10.0) as u32
-}
-
-#[inline]
 pub fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
